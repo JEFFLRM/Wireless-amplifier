@@ -1,0 +1,21 @@
+# ESP-IDF 构建产物（体积大，可本地重新生成，不入库）
+/build/
+/build_old_f/
+
+# ESP-IDF / 工具生成文件
+/.cache/
+/managed_components/
+/dependencies.lock.bak
+/.clangd
+/sdkconfig.old
+
+# 构建日志
+*.log
+build_err.txt
+build_log.txt
+
+# 编辑器 / 系统临时文件
+.vscode/settings.json.bak
+.vscode/settings.json.corrupt
+Thumbs.db
+.DS_Store

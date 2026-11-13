@@ -1,0 +1,121 @@
+CONFIG_IDF_TARGET_ESP32C5=y
+CONFIG_ESP_WIFI_ENABLED=y
+CONFIG_ESP_WIFI_5G_SUPPORT=y
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER=y
+CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=y
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
+
+# --- BLE 一键配网 (NimBLE) ---
+# 配网模式仅 BLE, 工作模式仅 WiFi (C5 BLE 2.4G / WiFi 5G 异频, 不会同时使用)
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+
+# --- BLE 传输缓冲池: 恢复 IDF 默认 (C5/SOC_ESP_NIMBLE_CONTROLLER) ---
+# 依据: D:\esp\v6.1\esp-idf\components\bt\host\nimble\Kconfig.in 各项 default。
+# 此前压缩到 EVT=8 导致控制器在广播使能时 ble_transport_alloc_evt(0) 分配不到
+# conn_comp_ev 事件缓冲, 每次返回 BLE_ERR_MEM_CAPACITY(0x207)/rc=519。
+# 恢复默认总代价约 13KB, 相比配网功能不可用可忽略。
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=24
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_SIZE=255
+CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=64
+CONFIG_BT_NIMBLE_TRANSPORT_EVT_SIZE=70
+CONFIG_BT_NIMBLE_TRANSPORT_EVT_DISCARD_COUNT=8
+# MSYS 共享 mbuf 池: 默认 24x128 + 24x320
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=24
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_SIZE=128
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=24
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_SIZE=320
+# 连接/安全/ATT: 配网单设备, 最小化
+CONFIG_BT_NIMBLE_MAX_BONDS=1
+CONFIG_BT_NIMBLE_WHITELIST_SIZE=4
+CONFIG_BT_NIMBLE_ATT_MAX_PREP_ENTRIES=8
+# 关闭未使用的 BLE5 特性与附加广播字段 (代码仅 legacy 广播)
+CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT=n
+CONFIG_BT_NIMBLE_LL_CFG_FEAT_LE_2M_PHY=n
+CONFIG_BT_NIMBLE_LL_CFG_FEAT_LE_CODED_PHY=n
+CONFIG_BT_NIMBLE_EXTRA_ADV_FIELDS=n
+# 关闭未使用的内置 profile 服务 (仅保留自定义 ff00 服务 + GAP 服务)
+CONFIG_BT_NIMBLE_PROX_SERVICE=n
+CONFIG_BT_NIMBLE_ANS_SERVICE=n
+CONFIG_BT_NIMBLE_CTS_SERVICE=n
+CONFIG_BT_NIMBLE_HTP_SERVICE=n
+CONFIG_BT_NIMBLE_IPSS_SERVICE=n
+CONFIG_BT_NIMBLE_TPS_SERVICE=n
+CONFIG_BT_NIMBLE_IAS_SERVICE=n
+CONFIG_BT_NIMBLE_LLS_SERVICE=n
+CONFIG_BT_NIMBLE_SPS_SERVICE=n
+CONFIG_BT_NIMBLE_HR_SERVICE=n
+CONFIG_BT_NIMBLE_BAS_SERVICE=n
+CONFIG_BT_NIMBLE_DIS_SERVICE=n
+# GAP 服务保留: ble_provision.c 调用 ble_svc_gap_init / ble_svc_gap_device_name_set
+CONFIG_BT_NIMBLE_GAP_SERVICE=y
+
+# --- lwIP: 必须启用 IPv4 分片重组 ---
+# 音频 UDP 报文 = RTP头12 + 载荷1536(32bit@48帧×8ch) = 1548B + IP头20 + UDP头8 = 1576B,
+# 超过 WiFi MTU 1500, 每个包被切成 2 片; 不开启重组则分片在 IP 层被静默丢弃,
+# 现象: ping(不分片)通但 UDP 音频 rx=0
+CONFIG_LWIP_IP4_REASSEMBLY=y
+# 重组 pbuf 上限: 默认 10 (= 5 个数据报的并发重组槽位) 曾足够 2304B payload 场景,
+# 现 payload 降到 1536B 但仍 2 片/包, 调到 32 (=16 个包) 留足并发余量。
+# 教训: 曾提到 48 导致投递率崩塌——残缺数据报(分片丢失)钉槽直到 15s 超时;
+# 但 32 比 48 克制, 同一时刻真正需重组的通常仅 2-3 包, 32 是安全上限。
+CONFIG_LWIP_IP_REASS_MAX_PBUFS=32
+
+# --- WiFi/lwIP 接收缓冲: 1100 数据报/秒 (每包 2 分片) 突发吸收 ---
+# 日志型二次丢包已从代码侧消除 (不再逐包打印), 这里把队列加深做双保险:
+# WiFi 动态 RX buffer 16->32, UDP socket mbox 6->16 (另在代码里 SO_RCVBUF=64KB)
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=32
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=16
+
+# --- 启用 PSRAM (ESP32-C5-N8R8 带 8MB; v6.1 C5 目标仅 Quad 模式, 依据 esp_psram/esp32c5/Kconfig.spiram) ---
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_QUAD=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+
+# --- NimBLE host 内存切换 PSRAM (核心修复 0x207) ---
+# v6.1 依据: nimble/Kconfig.in choice BT_NIMBLE_MEM_ALLOC_MODE, EXTERNAL 依赖 SPIRAM_USE_CAPS_ALLOC || SPIRAM_USE_MALLOC (已满足)
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
+
+# --- MSYS 共享 mbuf 改由 host 初始化, 配合 EXTERNAL 从 PSRAM 分配, 释放 controller 内部 RAM ---
+# v6.1 依据: esp32c5/Kconfig.in BT_LE_MSYS_INIT_IN_CONTROLLER default y; os_msys_init.c 含 !CONFIG 分支;
+# BT_NIMBLE_MSYS_BUF_FROM_HEAP 依赖该选项, 改 n 后由 host 侧 mempool/堆创建共享 msys 池
+CONFIG_BT_LE_MSYS_INIT_IN_CONTROLLER=y
+
+# --- 关 adv report 流控 (配网仅 peripheral 广播, 无 observer 扫描) ---
+# v6.1 依据: esp32c5/Kconfig.in BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_SUPP default y, depends on BT_LE_MSYS_INIT_IN_CONTROLLER
+CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_SUPP=n
+# --- 关闭 WiFi/BT 软件共存: C5 BLE(2.4G)/WiFi(5G) 异频且两模式互斥, 共存库无意义 ---
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=n
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="8MB"
+# --- 双 OTA 分区表 (WiFi 升级): ota_0/ota_1 各 3MB, N8R8 模组 8MB flash ---
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=n
+
+# --- 压缩 controller 内存: peripheral-only 无需扫描/加密/resolving ---
+CONFIG_BT_LE_SCAN_DUPL=n
+# v6.1 依据: C5 Kconfig range 5-100 default 20, 低于下限会被忽略并回落默认, 改为有效最小 5
+CONFIG_BT_LE_LL_DUP_SCAN_LIST_COUNT=5
+# v6.1 依据: C5 Kconfig range 1-5 default 4, 0 会被忽略并回落 4, 改为有效最小 1
+CONFIG_BT_LE_LL_RESOLV_LIST_SIZE=1
+CONFIG_BT_NIMBLE_LL_CFG_FEAT_LE_ENCRYPTION=n
+
+# --- 控制器 adv/conn 状态机预留数 (直接决定 adv enable 是否报 0x207) ---
+# v6.1 依据: esp32c5/Kconfig.in EXT_ADV_RESERVED range 0-4 default 2, help 明确说明
+# 缩减会导致 "advertising start failure due to memory shortage" (即 hci_err=0x207/rc=519)。
+# 之前手改 sdkconfig 为 0 导致每次 adv enable 都动态分配并失败, 改回 1 即够单条 legacy 广播
+# (50 特性关闭时 MAX_EXT_ADV_INSTANCES=1, MIN 取 1)
+CONFIG_BT_LE_EXT_ADV_RESERVED_MEMORY_COUNT=1
+# 连接状态机预留 1, 与 NIMBLE_MAX_CONNECTIONS=1 匹配, 避免建连时动态分配失败
+CONFIG_BT_LE_CONN_RESERVED_MEMORY_COUNT=1

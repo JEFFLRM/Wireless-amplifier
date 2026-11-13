@@ -1,0 +1,17 @@
+# 分区表: 8MB flash, 双 OTA app 分区 (支持 WiFi 空中升级)
+#
+# 首次烧录 (USB):
+#   esptool write-flash --flash-size 8MB \
+#     0x2000  bootloader/bootloader.bin \
+#     0x8000  partition_table/partition-table.bin \
+#     0x20000 RECEIVER_HIFI.bin
+#
+# 之后可通过 http://<设备IP>:8080/ 上传 build/RECEIVER_HIFI.bin 升级。
+# 注意: 若实际 flash 只有 2MB/4MB, 请勿使用该分区表 (分区越界会导致启动失败)。
+#
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x6000,
+otadata,    data, ota,     0xf000,   0x2000,
+phy_init,   data, phy,     0x11000,  0x1000,
+ota_0,      app,  ota_0,   0x20000,  0x300000,
+ota_1,      app,  ota_1,   0x320000, 0x300000,
