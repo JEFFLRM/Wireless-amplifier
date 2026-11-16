@@ -2,19 +2,23 @@
  * receiver.c - 7.1CH 无线音频接收端 (ESP32-C5, 5GHz WiFi STA)
  * 单声道单播 RTP 接收 + XOR FEC 丢包恢复 + 发现广播 (声道+IP)
  *
- * 协议 (PC 发送端按此实现):
- *   - RTP 头: v_p_x_cc=0x80, pt=96(数据)/97(FEC), seq/ts/ssrc 网络序
- *   - 数据包: 每包 48 帧 @48kHz x 1 声道 x 32bit(4字节小端) = 192B 载荷,
- *     总长 204B (RTP头12+载荷192) 小于 MTU 不分片; 发送端按各接收端发现包
- *     通告的 IP 单播该台对应的声道数据 (不再使用 8ch 组播大包)
- *   - FEC: 每 10 个数据包异或生成 1 个校验包; 发送端 FEC 包 seq = 本组首包 seq - 1
- *          (即 FEC 包 seq=F 保护数据包 seq 落在 [F+1, F+10], uint16 回绕)
+ * 协议 v1.3 (PC 发送端按此实现, 1ms 流与批量流并存):
+ *   - RTP 头: v_p_x_cc=0x80, pt=96(1ms数据)/97(1ms FEC)/100(批量数据)/101(批量 FEC),
+ *     seq/ts/ssrc 网络序
+ *   - 1ms 数据包: 每包 48 帧 @48kHz x 1 声道 x 32bit(4字节小端) = 192B 载荷,
+ *     总长 204B (RTP头12+载荷192) 小于 MTU 不分片
+ *   - 批量数据包 (v1.3): 载荷 = B 个连续 1ms 载荷拼接 (B=2~4, 384/576/768B),
+ *     包 ts 为首帧墙钟, 每包 ts 增量 = 48 x B; 接收端按 1ms 拆帧入环,
+ *     因 due 调度逐帧判定, 量化误差无感
+ *   - FEC: 1ms 流每 10 包异或生成 1 个校验包 (N=10); 批量流每 5 包 1 个 (N=5,
+ *     恢复窗口 = 5 x B ms, 保证恢复出的包仍在抖动预算内);
+ *     发送端 FEC 包 seq = 本组首包 seq - 1 (即 FEC 包 seq=F 保护 [F+1, F+N], uint16 回绕)
  *   - SSRC = 0x7C41; 声道序号 slot0..7 = L/R/C/LFE/SL/SR/SBL/SBR
  *   - 发现广播: 拿到 IP 后向本网段广播地址的 UDP 6000 端口发送 21 字节,
  *     周期自适应: 未收到音频流时每 5s 一次, 收到音频流后每 20s 一次:
  *     RTP 头(pt=98, seq 递增, ts=开机毫秒) + id(1B, 配网下发的设备编号 0~255)
- *     + slot_bit(1B, 声道按 bit: 1<<slot) + tx_enable(1B: 1=正常发送 / 0=停止发送到本机)
- *     + 本机IPv4(4B 网络序)
+ *     + slot_bit(1B, 声道按 bit: 1<<slot) + flags(1B: bit0=tx_enable 1=正常发送/0=停止,
+ *     bit1=caps 1=支持批量流 PT100/101) + 本机IPv4(4B 网络序)
  *     + CRC16-CCITT-FALSE 包尾(对前 19 字节计算, 小端 2B), 供发送端自动发现
  *     配网下发新配置时: 工作模式 BLE/WiFi 共存, 直接在当前 (旧) WiFi 上连发 3 个
  *     tx_enable=0 的停止通告 (无需重连), 再重启用新配置连 WiFi (重启后 tx_enable 恒为 1)
@@ -50,8 +54,11 @@
 #include "esp_system.h" /* ESP 系统 API (esp_restart 等) */
 #include "esp_heap_caps.h" /* 堆能力分配 (heap_caps_malloc, MALLOC_CAP_SPIRAM) */
 #include "esp_timer.h" /* 高精度定时器 (统计间隔计时) */
-#include "esp_sntp.h"   /* SNTP: 与 sender 端对齐, 多设备同步的绝对时间基准 */
+#include "esp_netif_sntp.h" /* esp_netif_sntp_init/deinit + esp_sntp_config_t: 对时发端 */
+#include "esp_sntp.h"        /* sntp_get_sync_status / sntp_set_time_sync_notification_cb: 对时状态查询与回调 */
 #include <sys/time.h>   /* gettimeofday: 绝对墙钟 (SNTP 同步后即 NTP 时间) */
+#include <time.h>       /* localtime_r/strftime: 授时日志格式化本地时间 */
+#include <arpa/inet.h>  /* inet_ntoa_r: 把 from.sin_addr 转点分十进制字符串, 用于 SNTP server 地址 */
 #include "esp_wifi.h" /* WiFi API (esp_wifi_init/set_band 等) */
 #include "esp_netif.h" /* 网络接口 (netif) */
 #include "esp_event.h" /* 事件循环 */
@@ -79,9 +86,15 @@
 #define FRAMES_PKT     48                 /* 每包帧数 (1ms @48kHz) */
 #define BYTES_SAMPLE   (BIT_DEPTH / 8)    /* 每样本字节数 = 4 */
 #define PAYLOAD_LEN    (FRAMES_PKT * BYTES_SAMPLE)  /* 单声道载荷 = 48帧 x 4B = 192B (每包只含本机 1 个声道) */
-#define FEC_N          10                 /* 每 FEC_N 个数据包生成 1 个 XOR 校验包 */
-#define RTP_PT         96                 /* 数据包 PT */
-#define RTP_PT_FEC     97                 /* FEC 包 PT */
+#define FEC_N          10                 /* 1ms 流: 每 FEC_N 个数据包生成 1 个 XOR 校验包 */
+#define RTP_PT         96                 /* 1ms 数据包 PT */
+#define RTP_PT_FEC     97                 /* 1ms FEC 包 PT */
+/* ---- v1.3 批量流 (2~4ms/包) ---- */
+#define RTP_PT_BATCH     100              /* 批量数据包 PT */
+#define RTP_PT_BATCH_FEC 101              /* 批量 FEC 包 PT */
+#define BATCH_MAX_B      4                /* 单包最大 4ms (4 x 48 帧) */
+#define FEC_N_BATCH      5                /* 批量流 FEC 组大小: 恢复窗口 5 x B ms */
+#define BATCH_MAX_PAYLOAD (PAYLOAD_LEN * BATCH_MAX_B) /* 批量载荷上限 = 768B */
 #define SSRC           0x7C41 /* 本系统流的同步源标识, 用于过滤其他流 */
 
 /* ---------- 调试开关 ---------- */
@@ -102,7 +115,7 @@
 /* ---------- FEC 缓存 / 环形缓冲参数 ---------- */
 #define FEC_CACHE_SZ   58                 /* 包缓存槽数, 必须覆盖 水位+FEC组+突发 (48+10+余量);
                                             20 槽时 drain 落后 >20 包会被 hash 同槽覆盖, 造成额外假丢包.
-                                            每槽 ~2.3KB, 整体放 PSRAM */
+                                            每槽 ~0.8KB (批量包 768B), 整体放 PSRAM */
 #define FEC_GROUP_REC  8                  /* 记录最近 FEC 组状态 (80ms 窗口) */
 #define RING_PKTS      160                /* 环形缓冲容量: 160 包 = 160ms (给丢包/突发留足余量, 正常不靠它控延迟) */
 #define TARGET_WMARK   48                 /* 起播水位: 攒够 48 包(48ms)再起播, 这就是抖动缓冲垫;
@@ -123,6 +136,8 @@
 #define DRAIN_FILL_MAX    16              /* 单次排水最多补多少个静音 (保证缺包后几 ms 内追上最新包) */
 #define GAP_JUMP_PKTS     32              /* 落后最新包超过该值就跳时间轴, 不再补几十 ms 静音 */
 #define TS_SANE_MS        2000            /* ts 与本地墙钟偏差超过 2s 视为发送端 ts 非墙钟, 回退本地锚定 */
+#define SYNC_WAIT_MS      10000           /* 起播前最长等待对时 (方案 A §F1 超时兜底): 超时降级为按 seq 播放 */
+#define NTP_SYNC_INTERVAL_MS 20000        /* NTP 刷新周期 20s (RFC4330 下限 15s); 压小多箱间晶振漂移 */
 
 /* RTP 头 (与 sender.c 完全一致: 12 字节, packed) */
 typedef struct __attribute__((packed)) { /* RTP 固定头结构 (12 字节, 强制 1 字节对齐, 与 sender.c 完全一致) */
@@ -160,6 +175,12 @@ static struct { /* 统计结构体: 网络/I2S 运行计数 */
     uint32_t rx_short;     /* 短于 RTP 头的包 (诊断: 小包/UDP 可达性测试) */
     uint32_t rx_badlen;    /* 长度 != 头+载荷 丢弃 (诊断: IP 分片重组失败) */
     uint32_t fec_bad;      /* FEC 组缺 >=2 包无法恢复的次数 (仅汇总统计, 不逐组打印) */
+    uint32_t rx_batch;     /* 收到的批量数据包 (pt=100) */
+    uint32_t rx_batch_fec; /* 收到的批量 FEC 包 (pt=101) */
+    uint32_t missed_batch; /* 批量流补静音帧数 (ms, 与 1ms 流分开统计) */
+    uint32_t late_drop;    /* 因"时间戳落后"被丢弃的帧数 (没声音的直接原因之一) */
+    uint32_t late_jump;    /* 时基跳变重锚次数 (late < -500ms: 发端重启/换曲/ts 基准突变) */
+    uint32_t late_fix;     /* 严重滞后强制重建时基次数 (late > 250ms: 时基长期不一致) */
 } s_stats; /* 全局统计实例 */
 
 /* 最近一次收到音频数据包的时刻 (微秒); 0=从未收到。发现任务据此动态调整广播周期 */
@@ -169,8 +190,9 @@ static volatile int64_t s_last_rx_us = 0;
 typedef struct { /* FEC 缓存槽: 按 seq 散列缓存最近收到的数据包 */
     uint16_t seq; /* 缓存包的 RTP 序号 */
     bool     valid; /* 槽位有效标志 */
+    uint16_t len; /* 载荷字节数: 192=1ms 包 / 384~768=批量包 */
     uint32_t ts; /* sender 的 RTP ts (wall_ms × 48), 用于绝对墙钟定时 */
-    uint8_t  data[PAYLOAD_LEN]; /* 完整载荷 (192 字节, 单声道) */
+    uint8_t  data[BATCH_MAX_PAYLOAD]; /* 完整载荷 (1ms 192B / 批量最多 768B) */
 } pkt_cache_t; /* 缓存槽类型定义结束 */
 
 static pkt_cache_t *s_cache;             /* FEC 包缓存 (FEC_CACHE_SZ 槽, app_main 中分配到 PSRAM) */
@@ -178,6 +200,7 @@ static pkt_cache_t *s_cache;             /* FEC 包缓存 (FEC_CACHE_SZ 槽, app
 typedef struct { /* FEC 组状态记录: 标记某组是否已收到/可恢复 */
     uint16_t fec_seq;      /* FEC 包 seq */
     uint8_t  state;        /* 0=未用, 1=已收且组内可恢复/冗余, 2=已收但组内缺>1 无法恢复 */
+    uint8_t  window;       /* 组大小: 10=1ms 流 / 5=批量流 */
     bool     valid; /* 记录有效标志 */
 } fec_group_state_t; /* 组状态类型定义结束 */
 
@@ -186,19 +209,21 @@ static fec_group_state_t s_fec_groups[FEC_GROUP_REC]; /* 最近 FEC 组状态环
 static uint16_t s_last_played = 0; /* 已播放到的最大包 seq */
 static bool     s_has_last    = false; /* 是否已确定播放起点 */
 static uint32_t s_last_ts     = 0; /* 最后入队包的时间戳 (静音包据此合成单调递增 ts, 保证时间轴不被静音打断) */
+static uint8_t  s_batch_b     = 1; /* 当前流每包毫秒数: 1=1ms 流 / 2~4=批量流 (按最近收到的数据包学习) */
 
 /* seq 回绕安全比较 (窗口远小于 32768) */
 static int16_t seq_diff(uint16_t a, uint16_t b) { return (int16_t)(a - b); } /* 回绕安全差值: uint16 相减转 int16 判正负 */
 static bool seq_gt(uint16_t a, uint16_t b) { return seq_diff(a, b) > 0; } /* 回绕安全比较: a > b */
 static bool seq_lt(uint16_t a, uint16_t b) { return seq_diff(a, b) < 0; } /* 回绕安全比较: a < b */
 
-static void cache_put(uint16_t seq, uint32_t ts, const uint8_t *payload) /* 写入缓存槽: 按 seq 散列定位 */
+static void cache_put(uint16_t seq, uint32_t ts, const uint8_t *payload, uint16_t len) /* 写入缓存槽: 按 seq 散列定位 */
 { /* 函数体开始 */
     int idx = seq % FEC_CACHE_SZ; /* 散列槽号: seq 对槽数取模 */
     s_cache[idx].seq   = seq; /* 记录序号 */
+    s_cache[idx].len   = len; /* 记录载荷长度 (192 / 批量 384~768) */
     s_cache[idx].ts    = ts;  /* 记录 sender 的 RTP ts (wall_ms × 48) */
     s_cache[idx].valid = true; /* 标记槽有效 */
-    memcpy(s_cache[idx].data, payload, PAYLOAD_LEN); /* 拷贝完整载荷到缓存槽 */
+    memcpy(s_cache[idx].data, payload, len); /* 拷贝完整载荷到缓存槽 */
 } /* 函数结束 */
 
 static pkt_cache_t *cache_get(uint16_t seq) /* 查询缓存包: 槽有效且序号一致才命中 */
@@ -210,11 +235,12 @@ static pkt_cache_t *cache_get(uint16_t seq) /* 查询缓存包: 槽有效且序�
     return NULL; /* 未命中返回 NULL */
 } /* 函数结束 */
 
-static void fec_group_set(uint16_t fec_seq, uint8_t state) /* 记录 FEC 组状态 (收到校验包后标记) */
+static void fec_group_set(uint16_t fec_seq, uint8_t state, uint8_t window) /* 记录 FEC 组状态 (收到校验包后标记) */
 { /* 函数体开始 */
     int slot = fec_seq % FEC_GROUP_REC; /* 环形槽号: 按 FEC 包 seq 取模 */
     s_fec_groups[slot].fec_seq = fec_seq; /* 记录 FEC 包序号 */
     s_fec_groups[slot].state   = state; /* 记录组状态 */
+    s_fec_groups[slot].window  = window; /* 记录组大小 (10 / 5) */
     s_fec_groups[slot].valid   = true; /* 标记该记录有效 */
 } /* 函数结束 */
 
@@ -224,7 +250,7 @@ static bool fec_group_covers(uint16_t seq, uint8_t *state_out) /* 查询某数�
     for (int i = 0; i < FEC_GROUP_REC; i++) { /* 遍历全部组状态记录 */
         if (!s_fec_groups[i].valid) continue; /* 跳过无效记录 */
         uint16_t d = (uint16_t)(seq - s_fec_groups[i].fec_seq); /* 计算与 FEC 包的相对偏移 (uint16 回绕安全) */
-        if (d >= 1 && d <= FEC_N) { /* 落在保护窗口 [1, FEC_N] 即被覆盖 */
+        if (d >= 1 && d <= s_fec_groups[i].window) { /* 落在保护窗口 [1, N] 即被覆盖 */
             *state_out = s_fec_groups[i].state; /* 输出该组的恢复状态供调用方决策 */
             return true; /* 命中返回 true */
         } /* 条件结束 */
@@ -263,6 +289,16 @@ static uint32_t ring_pkt_cnt(void) /* 查询当前缓冲区内的包数量 */
     n = s_ring.cnt / s_ring.pkt_bytes; /* 已用字节数除以单包字节得包数 */
     xSemaphoreGive(s_ring.lock); /* 解锁 */
     return n; /* 返回包数 */
+} /* 函数结束 */
+
+/* 查询剩余可入队包数: 批量包需一次性确认能放下 B 帧, 避免拆到一半失败造成重复/丢帧 */
+static uint32_t ring_room_pkts(void) /* 查询环形缓冲剩余空间 (以 1ms 包计) */
+{ /* 函数体开始 */
+    uint32_t n; /* 剩余包数 */
+    xSemaphoreTake(s_ring.lock, portMAX_DELAY); /* 加锁 */
+    n = (s_ring.cap - s_ring.cnt) / s_ring.pkt_bytes; /* 剩余字节 / 单包字节 */
+    xSemaphoreGive(s_ring.lock); /* 解锁 */
+    return n; /* 返回剩余包数 */
 } /* 函数结束 */
 
 /* 生产者入队; 满则丢弃新包 (返回 false) */
@@ -333,6 +369,10 @@ static void i2s_write_lr(const uint8_t *mono, size_t nbytes)
 
 /* 调试探针: i2s 最近一次定时判定, 供 stat 日志输出 (定位"无声"是超前死等还是欠载) */
 static volatile int32_t  s_dbg_late_ms;
+static volatile int32_t  s_dbg_late_min;      /* 统计窗内 late 最小值 (负=超前) */
+static volatile int32_t  s_dbg_late_max;      /* 统计窗内 late 最大值 (正=落后) */
+static volatile bool     s_dbg_use_wall;      /* 当前定时模式: true=绝对墙钟 / false=本地锚定 */
+static volatile int32_t  s_dbg_abs_off_ms;    /* 绝对模式下的纠偏偏移 (ms) */
 static volatile uint32_t s_dbg_ring_pkts;
 
 /* 当前绝对墙钟折算为 48kHz RTP 时钟 (32bit, 约 24.8h 回绕);
@@ -344,11 +384,73 @@ static uint32_t wall_rtp_now(void)
     return (uint32_t)((uint64_t)tv.tv_sec * 48000ULL + (uint64_t)tv.tv_usec * 48ULL / 1000ULL);
 }
 
-/* SNTP 是否已完成首次对时 (未对时时 gettimeofday 是 1970, 不能做绝对定时) */
+static volatile bool s_ntp_synced; /* 对时完成锁存 (回调置位; esp_sntp_get_sync_status 是一次性 API, 不能轮询) */
+
+/* SNTP 是否已完成首次对时 (未对时时 gettimeofday 是 1970, 不能做绝对定时)
+ * 注意: 不能轮询 esp_sntp_get_sync_status() —— ESP-IDF v6.1 该函数是一次性的,
+ * 读到 COMPLETED 后会把内部状态清回 RESET, 再读就是 0, 必须由回调锁存。 */
 static bool time_is_synced(void)
 {
-    return sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED;
+    return s_ntp_synced;
 }
+
+/* 授时诊断信息: 当前 NTP server / 对时完成次数 / 墙钟与发端 RTP ts 的偏差 (ms) */
+static char s_sntp_server[32] = "-";       /* 当前对时 server IP (未启动时为 "-") */
+static volatile uint32_t s_ntp_sync_cnt;   /* 对时完成次数 (stat 行 syncs=) */
+static volatile int32_t s_ntp_offset_ms;   /* 墙钟 - 发端 ts (ms, 正=墙钟超前; 收包时 EMA 更新) */
+
+/* 对时完成回调 (esp_netif_sntp 注册): 打印对时成功后的本地时间与当前偏差 */
+static void sntp_sync_cb(struct timeval *tv) /* 同步完成回调: 入参即刚设置的墙钟 */
+{ /* 函数体开始 */
+    char tstr[32] = "--:--:--"; /* 本地时间字符串 (格式化失败时保留占位) */
+    struct tm tm_now; /* 拆分后的年月日时分秒 */
+    time_t sec = tv->tv_sec; /* 刚由 SNTP 写入的墙钟秒数 */
+    if (localtime_r(&sec, &tm_now) != NULL) { /* 转本地时间 (中国时区由 sdkconfig 设定) */
+        strftime(tstr, sizeof(tstr), "%Y-%m-%d %H:%M:%S", &tm_now); /* 格式化为可读时间 */
+    } /* 转换成功分支结束 */
+    s_ntp_sync_cnt++; /* 对时成功次数累加 */
+    s_ntp_synced = true; /* 锁存"已对时" (api 状态是一次性的, 不能轮询) */
+    ESP_LOGI(TAG, "SNTP 已对齐 #%lu: %s (server=%s, offset=%ldms)", /* 日志: 次数/墙钟/发端/偏差 */
+             (unsigned long)s_ntp_sync_cnt, tstr, s_sntp_server, /* 次数, 本地时间, server IP */
+             (long)s_ntp_offset_ms); /* 墙钟-发端 ts 偏差 (若还没收到音频包则为 0) */
+} /* 函数结束 */
+
+/* 启动/重建 SNTP 对齐: 以发端 IP 为 NTP server (RTP 源 IP 零配置自动跟随);
+ * 若已启动过但 server IP 变了, 先 deinit 再 init, 保证 WiFi 重连/发端换 IP 后时基自动跟上 */
+static esp_err_t sntp_start_to(const char *server_ip) /* 启动 SNTP, server_ip 用标准 IPv4 点分十进制 */
+{ /* 函数体开始 */
+    static bool s_sntp_init_done = false; /* esp_netif_sntp_init 只允许一次, 换 server 必须 deinit 再 init */
+
+    if (server_ip == NULL || *server_ip == '\0') return ESP_ERR_INVALID_ARG; /* 入参空 */
+
+    /* 同 IP 已启动: 幂等 (不能读 esp_sntp_get_sync_status 判断, 该 API 会消费状态) */
+    if (s_sntp_init_done && strcmp(s_sntp_server, server_ip) == 0) {
+        return ESP_OK; /* 已对齐或正在对齐, 不需要重建 */
+    }
+    if (s_sntp_init_done) { /* 换 IP / 强制重建: deinit */
+        esp_netif_sntp_deinit(); /* 释放 SNTP 资源 */
+        strcpy(s_sntp_server, "-"); /* 旧 server 失效, 重置诊断字段 */
+        s_ntp_offset_ms = 0; /* 偏差随 server 变化, 清零重测 */
+        s_ntp_synced = false; /* 换 server 后需重新等待对时 (起播门控会重新计时) */
+        s_sntp_init_done = false; /* 重置标记 */
+    }
+
+    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG(server_ip); /* 单 server 配置 (方案 §4.1 只有一个内网发端) */
+    cfg.smooth_sync = false; /* 方案 A §F1 坑 2: 必须 false —— 1970 起点的钟靠 µs 级缓调永远追不上墙钟, synced 恒 0 */
+    cfg.sync_cb = sntp_sync_cb; /* 通过 cfg 注册回调: esp_netif_sntp_init 会用该字段覆盖全局回调 */
+    esp_err_t err = esp_netif_sntp_init(&cfg); /* 启动 SNTP */
+    if (err == ESP_OK) { /* 成功 */
+        sntp_set_sync_interval(NTP_SYNC_INTERVAL_MS); /* 稳态刷新周期 20s (kconfig 默认 1h 太大) */
+        sntp_restart(); /* 立即生效并马上发首包, 不等 STARTUP_DELAY */
+        s_sntp_init_done = true; /* 标记已 init */
+        strncpy(s_sntp_server, server_ip, sizeof(s_sntp_server) - 1); /* 缓存 server IP (供 stat/回调打印) */
+        s_sntp_server[sizeof(s_sntp_server) - 1] = '\0'; /* 保证字符串终止 */
+        ESP_LOGI(TAG, "SNTP 启动 (server=%s), 与发端对齐", server_ip); /* 日志: 启动成功 */
+    } else { /* 失败 */
+        ESP_LOGE(TAG, "SNTP 启动失败 err=0x%x", err); /* 日志: 启动失败码 */
+    }
+    return err; /* 返回状态 */
+} /* 函数结束 */
 
 /* 发送端 ts 是否真的是"墙钟×48"?
  * 协议里 ts 是保留字段, 实测 PC 发送端填的是"开机以来的采样计数"(首包 ts=4.05e8≈2.3h),
@@ -369,62 +471,84 @@ static bool deliver_silence(uint32_t ts) /* 向环形缓冲推入 1ms 静音 (�
     return true; /* 入队成功 */
 } /* 函数结束 */
 
-/* 单播单声道流: 从缓存包取出 ts + payload, 一起 push 到 ring 供 i2s_task 绝对墙钟定时 */
+/* 单播单声道流: 从缓存包取出 ts + payload, 一起 push 到 ring 供 i2s_task 绝对墙钟定时;
+ * 批量包 (B=2~4) 按 1ms 拆帧入环, 帧 ts = 包 ts + 帧序 x 48, due 调度逐帧判定 */
 static bool deliver_pkt(pkt_cache_t *p) /* 将缓存包交付给环形缓冲; 返回 false=ring 满未入队 */
 { /* 函数体开始 */
-    uint8_t buf[sizeof(uint32_t) + PAYLOAD_LEN]; /* [ts(4B) + payload(192B)] = 196B, 与 s_pkt_bytes 一致 */
-    memcpy(buf, &p->ts, sizeof(uint32_t)); /* 先拷贝 sender 的 RTP ts */
-    memcpy(buf + sizeof(uint32_t), p->data, PAYLOAD_LEN); /* 再拷贝音频载荷 */
-    if (!ring_push(buf)) return false; /* 入队失败: 不推进时间轴 */
-    s_last_ts = p->ts; /* 入队成功才推进时间轴 */
-    return true; /* 入队成功 */
+    uint8_t buf[sizeof(uint32_t) + PAYLOAD_LEN]; /* [ts(4B) + 1ms payload(192B)] */
+    int frames = (p->len > 0) ? (int)(p->len / PAYLOAD_LEN) : 0; /* 本包含几个 1ms 帧 */
+    if (frames <= 0) return false; /* 长度异常: 不入队 */
+    if (ring_room_pkts() < (uint32_t)frames) return false; /* 空间不足整包放下: 等 i2s 消费, 不拆半包 */
+    for (int i = 0; i < frames; i++) { /* 逐帧交付 */
+        uint32_t fts = p->ts + (uint32_t)i * 48u; /* 帧 ts: 包首帧墙钟 + 帧序 x 48 */
+        memcpy(buf, &fts, sizeof(fts)); /* 写入帧 ts */
+        memcpy(buf + sizeof(fts), p->data + i * PAYLOAD_LEN, PAYLOAD_LEN); /* 拷贝该 1ms 载荷 */
+        if (!ring_push(buf)) return false; /* 入队失败: 停止 (空间已预检, 正常不会发生) */
+        s_last_ts = fts; /* 时间轴推进到该帧 */
+    } /* 帧循环结束 */
+    return true; /* 整包入队成功 */
 } /* 函数结束 */
 
 /* ============ FEC 处理 ============ */
-/* 收到 FEC 包: fec_seq=F, 保护数据包 seq 落在 [F+1, F+10] (uint16 回绕) */
-static void handle_fec(uint16_t fec_seq, const uint8_t *fec_data) /* 处理 FEC 校验包: 异或还原窗口内丢失的 1 个数据包 */
+/* 收到 FEC 包: fec_seq=F, 保护数据包 seq 落在 [F+1, F+n] (uint16 回绕);
+ * n=10 (pt=97, 1ms 流) 或 n=5 (pt=101, 批量流);
+ * 批量流载荷 B x 192B, 包间 ts 增量 = 48 x B */
+static void handle_fec(uint16_t fec_seq, const uint8_t *fec_data, uint16_t fec_len, uint8_t n) /* 处理 FEC 校验包: 异或还原窗口内丢失的 1 个数据包 */
 { /* 函数体开始 */
-    uint8_t xor_buf[PAYLOAD_LEN]; /* 异或累加缓冲区 (192 字节) */
-    memset(xor_buf, 0, sizeof(xor_buf)); /* 异或缓冲清零 */
+    uint8_t xor_buf[BATCH_MAX_PAYLOAD]; /* 异或累加缓冲区 (最大 768 字节) */
+    uint8_t b = (uint8_t)(fec_len / PAYLOAD_LEN); /* 每包毫秒数: 1=1ms 流 / 2~4=批量流 */
+    if (b == 0) return; /* 长度异常: 忽略 */
+    memset(xor_buf, 0, fec_len); /* 异或缓冲清零 */
     int      cnt     = 0; /* 已收集到的数据包计数 */
     uint16_t missing = 0; /* 记录缺失包的 seq (缺 1 包时用于恢复) */
     uint16_t known_seq = 0; /* 已知包 seq (用于推算缺失包 ts) */
     uint32_t known_ts  = 0; /* 已知包 ts */
 
-    for (int i = 1; i <= FEC_N; i++) { /* 遍历保护窗口 [fec_seq+1, fec_seq+FEC_N] */
+    for (int i = 1; i <= n; i++) { /* 遍历保护窗口 [fec_seq+1, fec_seq+n] */
         uint16_t seq = (uint16_t)(fec_seq + i); /* 计算窗口内数据包 seq */
         pkt_cache_t *p = cache_get(seq); /* 从缓存查询该包 */
-        if (p) { /* 包在缓存中 */
-            for (int j = 0; j < PAYLOAD_LEN; j++) xor_buf[j] ^= p->data[j]; /* 逐字节异或累加, 用于还原缺失包 */
+        if (p && p->len == fec_len) { /* 包在缓存中且长度匹配同一流 */
+            for (int j = 0; j < fec_len; j++) xor_buf[j] ^= p->data[j]; /* 逐字节异或累加, 用于还原缺失包 */
             cnt++; /* 计数加一 */
             known_seq = seq; known_ts = p->ts; /* 记录一个已知包, 恢复时推算 ts */
-        } else { /* 包缺失 */
+        } else { /* 包缺失 (或长度不等于 FEC 组, 视为不同流) */
             missing = seq; /* 记录缺失包序号 */
         } /* 缺失分支结束 */
     } /* 窗口循环结束 */
 
-    if (cnt == FEC_N) { /* 情况1: 窗口内全部收到, 无需恢复 */
-        fec_group_set(fec_seq, 1);        /* 冗余包, 无丢包 */
-    } else if (cnt == FEC_N - 1) { /* 情况2: 恰好缺 1 包, 用 FEC 校验包异或还原 */
-        for (int j = 0; j < PAYLOAD_LEN; j++) xor_buf[j] ^= fec_data[j]; /* 校验包逐字节异或, 还原出缺失包内容 */
-        /* 推算缺失包的 ts: sender 每批间隔 1ms, ts 差 48 */
-        uint32_t recovered_ts = known_ts + (uint32_t)(seq_diff(missing, known_seq)) * 48u;
-        cache_put(missing, recovered_ts, xor_buf); /* 恢复缺失包入缓存 (带推算 ts) */
-        fec_group_set(fec_seq, 1); /* 记录该 FEC 组已处理 (防止后续按缺包重复静音) */
+    if (cnt == n) { /* 情况1: 窗口内全部收到, 无需恢复 */
+        fec_group_set(fec_seq, 1, n);        /* 冗余包, 无丢包 */
+    } else if (cnt == n - 1) { /* 情况2: 恰好缺 1 包, 用 FEC 校验包异或还原 */
+        for (int j = 0; j < fec_len; j++) xor_buf[j] ^= fec_data[j]; /* 校验包逐字节异或, 还原出缺失包内容 */
+        /* 推算缺失包的 ts: 1ms 流每包差 48, 批量流每包差 48 x B */
+        uint32_t recovered_ts = known_ts + (uint32_t)seq_diff(missing, known_seq) * (48u * b);
+        cache_put(missing, recovered_ts, xor_buf, fec_len); /* 恢复缺失包入缓存 (带推算 ts) */
+        fec_group_set(fec_seq, 1, n); /* 记录该 FEC 组已处理 (防止后续按缺包重复静音) */
         s_stats.recovered++; /* 恢复成功计数加一 */
         /* 不逐包打印日志! 115200 波特下每行阻塞 UART ~5ms, 密集恢复时日志本身
          * 会堵死收包循环造成二次突发丢包 (恢复/坏组日志曾在 100ms 内连打 10 行) */
     } else { /* 情况2 结束 */
-        fec_group_set(fec_seq, 2);        /* 缺 >1 包, 无法恢复, 缺口将静音 */
+        fec_group_set(fec_seq, 2, n);        /* 缺 >1 包, 无法恢复, 缺口将静音 */
         s_stats.fec_bad++; /* 坏组数计入汇总, 由 stat 任务每 5 秒统一输出 */
     } /* 情况3 结束 */
 } /* 函数结束 */
 
 /* ============ 按序投递 (drain) ============ */
+/* 补 n 个 1ms 静音帧 (批量流缺 1 包 = 缺 B ms); 空间不足返回 false */
+static bool deliver_silence_n(int n) /* 连续补 n 个 1ms 静音, ts 单调推进 */
+{ /* 函数体开始 */
+    if (ring_room_pkts() < (uint32_t)n) return false; /* 空间不足整段放下: 不拆半段 */
+    for (int i = 0; i < n; i++) { /* 逐帧入队 */
+        if (!deliver_silence(s_last_ts + 48)) return false; /* 入队失败即停 */
+    } /* 循环结束 */
+    return true; /* 全部入队成功 */
+} /* 函数结束 */
+
 static void drain_pkts(void) /* 排水: 尽量按 seq 顺序从缓存交付可连续播放的包 */
 { /* 函数体开始 */
-    int sil = 0; /* 本次 drain 已插入的静音包数, 限制单次最多补 1 个 ring 深度,
+    int sil = 0; /* 本次 drain 已插入的静音段数, 限制单次最多补 1 个 ring 深度,
                     防止 seq 大跳变时在收包循环里空转几万个循环 (曾观察到单次 +6.6 万) */
+    const int frames = (s_batch_b >= 1 && s_batch_b <= BATCH_MAX_B) ? s_batch_b : 1; /* 每包毫秒数 (缺 1 包补 frames ms) */
     while (1) { /* 持续循环直到无包可排 */
         if (!s_has_last) { /* 尚未确定播放起点: 先找缓存中最小 seq */
             /* 起始: 找缓存中最旧 seq 作为播放起点 */
@@ -454,15 +578,17 @@ static void drain_pkts(void) /* 排水: 尽量按 seq 顺序从缓存交付可�
         uint8_t fstate = 0; /* 下一包缺失: 查询是否被已收 FEC 组覆盖 */
         if (fec_group_covers(next, &fstate)) { /* 已收 FEC 组覆盖该 seq (包确实发出但本机缺失) */
             /* 该缺口所在 FEC 组已收到: 若已恢复成功则上面 cache_get 会命中;
-             * 到这里说明原包丢失且未能恢复, 静音推进 (只补 1ms, 不会堆积) */
+             * 到这里说明原包丢失且未能恢复, 静音推进 (批量流补齐 B ms, 不会堆积) */
             if (sil++ >= DRAIN_FILL_MAX) break; /* 单次排水上限: 保证缺包后在几 ms 内追平最新包 */
-            if (!deliver_silence(s_last_ts + 48)) break; /* ring 满则停, 绝不越过未入队的包推进进度 */
+            if (!deliver_silence_n(frames)) break; /* ring 满则停, 绝不越过未入队的包推进进度 */
             s_last_played = next; /* 静音也推进播放进度 */
-            s_stats.missed++; /* 静音缺包计数加一 */
+            s_stats.missed += (uint32_t)frames; /* 静音缺包计数 (按 ms 计) */
+            if (s_batch_b > 1) s_stats.missed_batch += (uint32_t)frames; /* 批量流单独统计 */
             continue; /* 继续排水 */
         } /* FEC 覆盖分支结束 */
 
-        /* 超时保护: next 落后于缓存最新包超过 FEC_N, 说明永远等不到, 静音推进 */
+        /* 超时保护: next 落后于缓存最新包超过 FEC 组大小, 说明永远等不到, 静音推进 */
+        const int fec_win = (s_batch_b > 1) ? FEC_N_BATCH : FEC_N; /* 批量流恢复窗口按 5 包算 */
         uint16_t newest = 0; /* 下一包缺失且未被 FEC 覆盖: 判断是否已落后过多 */
         bool     has_new = false; /* 缓存中最新的 seq */
         for (int i = 0; i < FEC_CACHE_SZ; i++) { /* 是否找到有效包 */
@@ -483,17 +609,19 @@ static void drain_pkts(void) /* 排水: 尽量按 seq 顺序从缓存交付可�
                 ESP_LOGW(TAG, "sender stream restart detected (seq jumped back %d), resyncing", (int)back); /* 罕见事件, 允许打印 */
                 break; /* 等新流数据包到达后重新锚定 */
             } /* 流重启分支结束 */
-            if (back > FEC_N) { /* 最新包已超过期望包 FEC_N 以上: 确认该包已永远丢失 */
+            if (back > fec_win) { /* 最新包已超过期望包一个 FEC 组以上: 确认该包已永远丢失 */
                 if (back > GAP_JUMP_PKTS) { /* 缺口太大: 逐包补静音会把播放永久推后几十 ms, 直接跳时间轴 */
-                    s_stats.missed += (uint32_t)(back - 1); /* 缺口计入缺包统计 (不逐包入队) */
+                    s_stats.missed += (uint32_t)(back - 1) * (uint32_t)frames; /* 缺口计入缺包统计 (按 ms) */
+                    if (s_batch_b > 1) s_stats.missed_batch += (uint32_t)(back - 1) * (uint32_t)frames; /* 批量流单列 */
                     s_last_played = (uint16_t)(newest - 1); /* 跳到最新包前一位, 下一轮即可命中 */
                     ESP_LOGW(TAG, "seq gap too large (%d pkt), skip to newest %u", (int)back, (unsigned)newest); /* 罕见事件, 允许打印 */
                     continue; /* 重新排水 (next=newest 应从缓存命中) */
                 } /* 大缺口跳转分支结束 */
                 if (sil++ >= DRAIN_FILL_MAX) break; /* 单次排水上限: 几 ms 内追平, 不长时间占用收包任务 */
-                if (!deliver_silence(s_last_ts + 48)) break; /* ring 满则停, 等 i2s 消耗 */
+                if (!deliver_silence_n(frames)) break; /* ring 满则停, 等 i2s 消耗 */
                 s_last_played = next; /* 推进播放进度 */
-                s_stats.missed++; /* 缺包计数加一 */
+                s_stats.missed += (uint32_t)frames; /* 缺包计数 (按 ms 计) */
+                if (s_batch_b > 1) s_stats.missed_batch += (uint32_t)frames; /* 批量流单独统计 */
                 continue; /* 继续排水 */
             } /* 落后过多分支结束 */
         } /* 有效最新包判断结束 */
@@ -659,25 +787,17 @@ static void network_task(void *arg) /* 网络接收任务: 收 RTP 数据包/FEC
     esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"); /* netif 句柄, 用于判断 IP 就绪 */
 
     /* 外层循环: 等 IP 就绪后创建 socket, socket 出错后重建; 保证 WiFi 掉线重连后自动恢复收流 */
-    static bool s_sntp_started = false; /* SNTP 只启动一次 */
+    static bool s_sntp_started = false; /* SNTP 是否已在本 session 启动过 (WiFi 重连后重置, 用新发端 IP 重新对时) */
     while (1) {
+        s_sntp_started = false; /* 每次进入外层循环都重置: WiFi 重连后, 新发端 IP 必须触发一次新 SNTP */
         /* 等待有效 IP: 没拿到 IP 就每 1s 轮询一次 (同时事件回调在后台处理重连) */
         while (sock < 0) {
             if (sta_netif) { /* netif 有效 */
                 esp_netif_ip_info_t ipi; /* IP 信息结构 */
                 if (esp_netif_get_ip_info(sta_netif, &ipi) == ESP_OK && ipi.ip.addr != 0) { /* 已拿到非零 IP */
-                    /* SNTP 对时: sender/receiver 两端必须都对时, 才能用 RTP ts(NTP wall ms) 绝对时间对齐,
-                     * 实现多设备同步。smooth_sync 平滑校准(墙钟慢速趋近, 避免 ts 跳变) */
-                    if (!s_sntp_started) {
-                        s_sntp_started = true;
-                        esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-                        esp_sntp_setservername(0, "pool.ntp.org");
-#ifdef CONFIG_LWIP_SNTP_SMOOTH_SYNC
-                        esp_sntp_set_sync_mode(SNTP_SYNC_MODE_SMOOTH);
-#endif
-                        esp_sntp_init();
-                        ESP_LOGI(TAG, "SNTP 启动 (pool.ntp.org), 与 sender 绝对墙钟对齐");
-                    }
+                    /* 方案 A §F1: SNTP 不再直连 pool.ntp.org, 而是收 RTP 时取发端 IP 作为 server.
+                     * 这样音箱与发端同一 NTP 时基, 台间误差由"各自对公网 10~30ms"降到
+                     * "对齐 RTP ts 产生者 ±1~3ms" */
                     sock = udp_sock_open(DEF_AUDIO_PORT); /* 绑定固定 UDP 5004 单播端口 */
                     if (sock >= 0) { /* 成功 */
                         ESP_LOGI(TAG, "unicast bind OK, sock=%d, start recv", sock); /* 日志 */
@@ -689,7 +809,7 @@ static void network_task(void *arg) /* 网络接收任务: 收 RTP 数据包/FEC
             vTaskDelay(pdMS_TO_TICKS(1000)); /* 每 1s 轮询一次 IP */
         } /* 等待 IP + bind 成功循环结束 (此时 sock >= 0) */
 
-        uint8_t pkt[RTP_HDR_LEN + PAYLOAD_LEN]; /* 接收缓冲区: RTP 头 + 最大载荷 */
+        uint8_t pkt[RTP_HDR_LEN + BATCH_MAX_PAYLOAD]; /* 接收缓冲区: RTP 头 + 最大载荷 (批量 768B) */
         struct sockaddr_in from; /* 发送方地址结构 */
         socklen_t fromlen = sizeof(from); /* 地址结构长度 */
 
@@ -711,22 +831,45 @@ static void network_task(void *arg) /* 网络接收任务: 收 RTP 数据包/FEC
                 s_stats.bad_ssrc++; /* 非本系统流: 非法 SSRC 计数加一 */
                 continue; /* 丢弃该包 */
             } /* 非法 SSRC 分支结束 */
-            if (len != (int)(RTP_HDR_LEN + PAYLOAD_LEN)) { s_stats.rx_badlen++; continue; } /* 长度不符: 计数后丢弃 (疑似分片丢失) */
+            int plen = len - (int)RTP_HDR_LEN; /* 载荷长度 */
+            if (plen <= 0 || plen > BATCH_MAX_PAYLOAD || (plen % PAYLOAD_LEN) != 0) { /* 非整 1ms 帧的载荷: 丢弃 */
+                s_stats.rx_badlen++; /* 长度异常计数 (含 IP 分片重组失败) */
+                continue; /* 丢弃该包 */
+            } /* 长度检查结束 */
             const uint8_t *payload = pkt + RTP_HDR_LEN; /* 载荷指针指向 RTP 头之后 */
 
-            if (hdr->pt == RTP_PT) { /* 数据包 (pt=96) */
-                s_stats.rx_data++; /* 数据包接收计数加一 */
+            /* 方案 A §F1-2: 首次收到合法 RTP 包时, 用 RTP 源 IP 启动 SNTP 对齐发端.
+             * 运行期若已启动但 RTP 源 IP 变了 (发端换 IP / WiFi 漫游), sntp_start_to
+             * 内部会 deinit+init 重建, 保证时基始终跟着 ts 产生者走 */
+            if (!s_sntp_started) { /* 本 session 还没启动过 */
+                char ip_str[INET_ADDRSTRLEN]; /* 存点分十进制字符串 */
+                if (inet_ntoa_r(from.sin_addr, ip_str, sizeof(ip_str)) != NULL) { /* 转换成功 */
+                    s_sntp_started = (sntp_start_to(ip_str) == ESP_OK); /* 成功才标记已启动, 下次收包重试 */
+                } /* 转换分支结束 */
+            } /* SNTP 触发分支结束 */
+
+            if (hdr->pt == RTP_PT || hdr->pt == RTP_PT_BATCH) { /* 数据包 (pt=96 1ms / 100 批量) */
+                uint8_t b = (uint8_t)(plen / PAYLOAD_LEN); /* 本包毫秒数: 1 / 2~4 */
+                if (hdr->pt == RTP_PT && b != 1) { s_stats.rx_badlen++; continue; } /* pt=96 必须是 192B */
+                s_batch_b = b; /* 学习当前流每包毫秒数 (缺包补静音/恢复窗口据此计算) */
+                if (hdr->pt == RTP_PT) s_stats.rx_data++; else s_stats.rx_batch++; /* 分别计数 96/100 */
                 s_last_rx_us = esp_timer_get_time(); /* 记录最近收流时刻 (发现广播按有无音频流调周期) */
                 if (cache_get(seq)) { /* 重复包检测: 该 seq 已在缓存中 */
                     s_stats.seq_dup++; /* 重复包计数加一 */
                     continue; /* 丢弃重复包 */
                 } /* 重复分支结束 */
                 uint32_t ts = ntohl(hdr->ts); /* sender 的 RTP ts (wall_ms × 48) */
-                cache_put(seq, ts, payload); /* 新包写入缓存 (带 ts 供绝对墙钟定时) */
-                drain_pkts(); /* 触发排水: 按序交付可播放包 */
-            } else if (hdr->pt == RTP_PT_FEC) { /* 数据包分支结束 */
-                s_stats.rx_fec++; /* FEC 校验包 (pt=97) */
-                handle_fec(seq, payload); /* FEC 包接收计数加一 */
+                if (time_is_synced()) { /* 已对时: 采样"墙钟 - 发端 ts", 用于判断发端是否也按 NTP 打时间戳 */
+                    int32_t d_ms = (int32_t)(wall_rtp_now() - ts) / 48; /* ms, 32bit 差值自动处理回绕 */
+                    s_ntp_offset_ms = (d_ms + 3 * s_ntp_offset_ms) / 4; /* EMA 平滑, 抑制单包网络抖动 */
+                } /* 对时采样分支结束 */
+                cache_put(seq, ts, payload, (uint16_t)plen); /* 新包写入缓存 (带 ts 供绝对墙钟定时) */
+                drain_pkts(); /* 触发排水: 按 seq 交付, 批量包内部拆成 1ms 帧 */
+            } else if (hdr->pt == RTP_PT_FEC || hdr->pt == RTP_PT_BATCH_FEC) { /* FEC 校验包 (97 1ms / 101 批量) */
+                bool batch_fec = (hdr->pt == RTP_PT_BATCH_FEC); /* 是否批量流 FEC */
+                if (!batch_fec && plen != PAYLOAD_LEN) { s_stats.rx_badlen++; continue; } /* pt=97 必须是 192B */
+                if (batch_fec) s_stats.rx_batch_fec++; else s_stats.rx_fec++; /* 分别计数 97/101 */
+                handle_fec(seq, payload, (uint16_t)plen, batch_fec ? FEC_N_BATCH : FEC_N); /* 窗口: 批量 N=5 / 1ms N=10 */
                 drain_pkts(); /* 尝试异或恢复缺失数据包 */
             } /* 恢复后再次排水 */
         } /* 收包循环结束 */
@@ -739,14 +882,33 @@ static void stat_task(void *arg) /* 运行统计打印任务: 独立于收包循
     (void)arg; /* 忽略入参 */
     while (1) { /* 打印主循环 */
         vTaskDelay(pdMS_TO_TICKS(5000)); /* 每 5 秒打印一次 */
-        ESP_LOGI(TAG, "stat: rx=%lu fec=%lu rec=%lu fecbad=%lu miss=%lu drop=%lu under=%lu bad_ssrc=%lu short=%lu badlen=%lu late=%ldms ring=%lu", /* 日志: 收/校/恢/坏组/缺/丢/欠载/非法SSRC/短包/长度异常/late/ring深度 */
+        bool synced = time_is_synced(); /* 方案 A §F3: 对时状态 */
+        char wall[16] = "--:--:--"; /* 本地墙钟 HH:MM:SS (未对时显示占位, 避免 1970 误导) */
+        if (synced) { /* 已对时: 格式化当前墙钟 */
+            struct timeval tv; /* 当前墙钟 */
+            struct tm tm_now; /* 拆分后的时分秒 */
+            gettimeofday(&tv, NULL); /* 取 NTP 时间 */
+            if (localtime_r(&tv.tv_sec, &tm_now) != NULL) { /* 转本地时间 */
+                strftime(wall, sizeof(wall), "%H:%M:%S", &tm_now); /* 只打印时分秒, 行长可控 */
+            } /* 转换成功分支结束 */
+        } /* 对时分支结束 */
+        ESP_LOGI(TAG, "stat: rx=%lu fec=%lu rec=%lu fecbad=%lu miss=%lu late_drop=%lu jump=%lu fix=%lu drop=%lu under=%lu bad_ssrc=%lu short=%lu badlen=%lu pt100=%lu/%lu miss100=%lu late=%ld/%ld/%ldms ring=%lu mode=%s synced=%d ntp=%s syncs=%lu wall=%s off=%ldms abs_off=%ldms", /* 日志: 收/校/恢/坏组/缺/落后丢/跳变/强制重建/丢/欠载/非法SSRC/短包/长度异常/批量收包/批量FEC/批量缺帧/late(末/最小/最大)/ring/定时模式/对时状态/授时server/对时次数/墙钟/偏差/绝对纠偏 */
                  (unsigned long)s_stats.rx_data, (unsigned long)s_stats.rx_fec, /* 数据包与 FEC 包计数 */
                  (unsigned long)s_stats.recovered, (unsigned long)s_stats.fec_bad, /* 恢复数与不可恢复组数 */
-                 (unsigned long)s_stats.missed, /* 静音补缺计数 */
+                 (unsigned long)s_stats.missed, /* 静音补缺计数 (ms) */
+                 (unsigned long)s_stats.late_drop, (unsigned long)s_stats.late_jump, /* 时间戳落后丢弃 / 时基跳变 */
+                 (unsigned long)s_stats.late_fix, /* 严重滞后强制重建次数 */
                  (unsigned long)s_stats.dropped, (unsigned long)s_stats.underrun, /* 丢弃与欠载计数 */
                  (unsigned long)s_stats.bad_ssrc, /* SSRC 不符丢弃计数 */
                  (unsigned long)s_stats.rx_short, (unsigned long)s_stats.rx_badlen, /* 短包与长度异常计数 */
-                 (long)s_dbg_late_ms, (unsigned long)ring_pkt_cnt()); /* i2s 定时判定与 ring 深度 */
+                 (unsigned long)s_stats.rx_batch, (unsigned long)s_stats.rx_batch_fec, /* 批量数据包 / 批量 FEC 包 */
+                 (unsigned long)s_stats.missed_batch, /* 批量流补静音帧数 */
+                 (long)s_dbg_late_ms, (long)s_dbg_late_min, (long)s_dbg_late_max, /* late 末值/窗内最小/窗内最大 */
+                 (unsigned long)ring_pkt_cnt(), s_dbg_use_wall ? "wall" : "anchor", /* ring 深度 / 当前定时模式 */
+                 (int)synced, s_sntp_server, (unsigned long)s_ntp_sync_cnt, /* 对时状态 / 当前 server / 成功次数 */
+                 wall, (long)s_ntp_offset_ms, (long)s_dbg_abs_off_ms); /* 墙钟 HH:MM:SS / 墙钟-发端 ts / 绝对纠偏 */
+        s_dbg_late_min = 0; /* 重置统计窗最小值 */
+        s_dbg_late_max = 0; /* 重置统计窗最大值 */
     } /* 打印循环结束 */
 } /* 函数结束 */
 
@@ -759,12 +921,13 @@ static void stat_task(void *arg) /* 运行统计打印任务: 独立于收包循
 #define DISC_ACTIVE_HOLD_MS 3000 /* 最近 3s 内收到过音频数据包即视为"有流" */
 #define DISC_BURST_N     3    /* IP 变化/首次上线时连发次数 (加速发送端发现) */
 #define DISC_BURST_GAP_MS 200 /* 连发包间隔 */
+#define DISC_CAPS_BATCH  0x02 /* 发现包 [14] bit1: caps=1 声明支持批量流 PT100/101 (v1.3) */
 
-/* 发现包载荷 (紧跟 12B RTP 头之后): 设备 ID + 声道 bit + 发送使能 + IPv4 (网络序) */
+/* 发现包载荷 (紧跟 12B RTP 头之后): 设备 ID + 声道 bit + 发送使能/能力位 + IPv4 (网络序) */
 typedef struct __attribute__((packed)) {
     uint8_t  id;        /* 设备编号 0~255: 由 PC/手机配网 JSON "device_id" 下发, 同网段多台接收端必须各不相同 */
     uint8_t  slot_bit;  /* 本机声道按 bit 表示: 1<<slot_index, slot0..7 -> 0x01/0x02/0x04/.../0x80 */
-    uint8_t  tx_enable; /* 发送使能: 1=告知发送端正常向本机发送音频流; 0=告知发送端停止发送到本机 (配网变更时通告) */
+    uint8_t  tx_enable; /* v1.3 flags: bit0=发送使能 (1=正常发送/0=停止发送到本机), bit1=caps (1=支持批量流) */
     uint32_t ip;        /* 本机 IPv4 地址 (网络序大端, 发送端据此单播音频流) */
 } disc_payload_t; /* 7 字节 */
 
@@ -788,7 +951,8 @@ static uint16_t crc16_ccitt(const uint8_t *data, int len) /* 计算发现包 CRC
  *   [0..11]  RTP 头: 0x80, pt=98, seq(递增), ts(开机毫秒), ssrc=0x7C41
  *   [12]     id        设备编号 (配网下发, 0~255)
  *   [13]     slot_bit  本机声道按 bit: 1<<slot_index
- *   [14]     tx_enable 发送使能: 1=正常发送 / 0=停止发送到本机
+ *   [14]     flags      bit0=tx_enable (1=正常发送 / 0=停止发送到本机)
+ *                       bit1=caps (1=支持批量流 PT100/101; 本机恒为 1)
  *   [15..18] ip        本机 IPv4 (网络序)
  *   [19..20] CRC16 (CCITT-FALSE, 对 [0..18] 计算, 小端存放)   <- 包尾
  * 总长 21 字节, 限同网段广播 (目标 = ip | ~netmask), UDP 6000 端口 */
@@ -804,7 +968,9 @@ static void disc_send(int sock, const struct sockaddr_in *dst, /* 已建 socket 
     h.seq = htons(seq); /* 序号 (网络序) */
     h.ts  = htonl((uint32_t)(esp_timer_get_time() / 1000)); /* 时间戳 = 开机毫秒 */
     h.ssrc = htonl(SSRC); /* 系统标识 */
-    disc_payload_t p = { .id = id, .slot_bit = slot_bit, .tx_enable = tx_enable, .ip = ip }; /* 载荷: ID+声道bit+发送使能+IP */
+    disc_payload_t p = { .id = id, .slot_bit = slot_bit, /* 载荷: ID + 声道bit + 能力位 + IP */
+                         .tx_enable = (uint8_t)((tx_enable & 0x01u) | DISC_CAPS_BATCH), /* bit0=tx_enable, bit1=caps */
+                         .ip = ip }; /* 本机 IPv4 */
 
     uint8_t pkt[sizeof(rtp_header_t) + sizeof(disc_payload_t) + 2]; /* 包缓冲: 头+载荷+CRC16 = 21B */
     memcpy(pkt, &h, sizeof(h)); /* 填头 */
@@ -864,8 +1030,8 @@ static void discovery_task(void *arg) /* 发现广播任务: 每 5s/20s 广播�
         } /* 连发循环结束 */
 
         if (first) { /* IP 变化/首次上线: 打印一次发现参数便于验证 */
-            ESP_LOGI(TAG, "discovery: id=%u slot_bit=0x%02X tx_en=%u ip=%u.%u.%u.%u bcast=%u.%u.%u.%u:%u", /* 日志 */
-                     dev_id, slot_bit, s_tx_enable, /* 设备编号 / 声道 bit / 发送使能 */
+            ESP_LOGI(TAG, "discovery: id=%u slot_bit=0x%02X flags=0x%02X ip=%u.%u.%u.%u bcast=%u.%u.%u.%u:%u", /* 日志 */
+                     dev_id, slot_bit, (unsigned)((s_tx_enable & 0x01u) | DISC_CAPS_BATCH), /* 设备编号 / 声道 bit / tx_enable|caps */
                      (unsigned)cur & 0xFF, (unsigned)(cur >> 8) & 0xFF, /* IP 前两字节 */
                      (unsigned)(cur >> 16) & 0xFF, (unsigned)(cur >> 24) & 0xFF, /* IP 后两字节 */
                      (unsigned)dst.sin_addr.s_addr & 0xFF, (unsigned)(dst.sin_addr.s_addr >> 8) & 0xFF, /* 广播地址前两字节 */
@@ -888,7 +1054,7 @@ static void discovery_task(void *arg) /* 发现广播任务: 每 5s/20s 广播�
 } /* 函数结束 */
 
 /* ============ BLE 连接提示音 (白噪声 + 呼吸式包络, 持续播放) ============ */
-#define TONE_AMP       0.25f                       /* 峰值幅度 -12dBFS, 兼顾清晰与不刺耳 */
+#define TONE_AMP       0.0625f                      /* 峰值幅度 -24dBFS (原 0.25 -12dBFS 降到 1/4, 四等分 -6dB) */
 #define TONE_BREATH_S  4.0f                        /* 呼吸包络周期: 4s 一个完整起伏 (约 15 次/分) */
 #define TONE_NOISE_SEED 0x12345678                 /* xorshift32 初始种子 (每次连接重置) */
 
@@ -968,8 +1134,9 @@ static void i2s_task(void *arg) /* I2S 播放任务: 从环形缓冲取包写 I2
     bool     started   = false;   /* 是否已越过水位线开始播放 */
     uint32_t anchor_ts = 0;       /* SNTP 未同步时的本地锚定: 首包 ts */
     int64_t  anchor_us = 0;       /* SNTP 未同步时的本地锚定: 首包写入时刻 */
-    int32_t  abs_off_ms = 0;      /* 绝对模式下的纠偏偏移 (发送端时序不准时抵消累积滞后) */
-    bool     use_wall  = false;   /* 是否用"发送端 ts = 墙钟"做绝对定时 (起播时锁定, 避免中途反复切换) */
+    bool     use_wall  = false;   /* 是否用"发送端 ts = 墙钟"做绝对定时 (起播时判定, 对时成功后自动升级) */
+    int64_t  sync_wait_us = 0;    /* 水位已够但 SNTP 未同步时的等待起点 (0=未开始计时) */
+    bool     sync_timeout_logged = false; /* 对时超时降级只告警一次 */
 
     int64_t  next_tick_us = 0;    /* 播放节拍: 每轮至少 1ms, 防止 DMA 不阻塞时空转抢占 network */
 
@@ -995,21 +1162,37 @@ static void i2s_task(void *arg) /* I2S 播放任务: 从环形缓冲取包写 I2
         }
         if (s_tone_req && !ble_provision_is_connected()) { s_tone_req = false; }
 
-        if (!started) { /* 等水位 (tick=100Hz, 1 tick = 10ms) */
-            if (ring_pkt_cnt() < TARGET_WMARK) {
+        if (!started) { /* 等水位 + 等对时 (方案 A §F1-③ / §F2-4) */
+            if (ring_pkt_cnt() < TARGET_WMARK) { /* 水位不够 */
+                sync_wait_us = 0; /* 没攒够包时不计对时等待 */
                 vTaskDelay(1); /* yield 给网络任务/IDLE, 不写静音 (避免 DMA 排队延迟) */
                 continue;
+            }
+            /* 水位已够但 SNTP 还没同步: 先缓存不出声, 避免各台按各自上电时刻起播导致台间错位.
+             * 最多等 SYNC_WAIT_MS, 超时降级为本地锚定播放 (能出声但台间可能不同步) */
+            if (!time_is_synced()) {
+                if (sync_wait_us == 0) sync_wait_us = esp_timer_get_time(); /* 开始计时 */
+                if (esp_timer_get_time() - sync_wait_us < (int64_t)SYNC_WAIT_MS * 1000) {
+                    vTaskDelay(1); /* 继续等对时, ring 继续积累 (上限由 RING_HIGH_PKTS 裁剪) */
+                    continue;
+                }
+                if (!sync_timeout_logged) { /* 只告警一次 */
+                    sync_timeout_logged = true;
+                    ESP_LOGW(TAG, "SNTP 未在 %dms 内同步 (server=%s), 降级为本地锚定播放 (台间可能不同步)", /* 日志 */
+                             SYNC_WAIT_MS, s_sntp_server);
+                }
             }
             ring_pop(out); /* 先出队首包 (用于锚定) */
             anchor_ts = *(uint32_t *)out;
             anchor_us = esp_timer_get_time();
-            use_wall  = ts_looks_wall(anchor_ts); /* 锁定定时模式: 发送端 ts 不是墙钟就用本地锚定 */
+            use_wall  = ts_looks_wall(anchor_ts); /* 起播判定: 已对时且 ts 与墙钟一致才用绝对定时 */
             started   = true;
+            s_dbg_use_wall = use_wall; /* 供 stat 行打印当前定时模式 */
             i2s_write_lr(payload, PAYLOAD_LEN); /* 首包立即播, DMA 管线从此跑起来 */
             amp_play_once();
-            ESP_LOGI(TAG, "playback start: first_ts=%lu mode=%s (DMA=%dms, lead=%dms)",
-                     (unsigned long)anchor_ts, use_wall ? "wall-clock" : "local-anchor",
-                     I2S_DMA_DEPTH_MS, PLAYOUT_LEAD_MS);
+            ESP_LOGI(TAG, "playback start: first_ts=%lu mode=%s (DMA=%dms, lead=%dms, off=%ldms)", /* 日志: 起播模式与时间基准差 */
+                     (unsigned long)anchor_ts, use_wall ? "wall-clock" : "local-anchor", /* 首包 ts / 定时模式 */
+                     I2S_DMA_DEPTH_MS, PLAYOUT_LEAD_MS, (long)s_ntp_offset_ms); /* DMA 深度 / 播放前瞻 / 墙钟-发端 ts */
             continue;
         }
 
@@ -1040,32 +1223,57 @@ static void i2s_task(void *arg) /* I2S 播放任务: 从环形缓冲取包写 I2
             continue;
         }
 
+        /* 对时成功后自动升级: 起播时若 SNTP 未同步会先按本地锚定跑, 同步完成后切到绝对墙钟,
+         * 否则多台音箱会一直保持各自锚定的相位差 (方案 A §F1-③) */
+        if (!use_wall && time_is_synced() && ts_looks_wall(ts)) {
+            use_wall = true; /* 切绝对定时 */
+            s_dbg_use_wall = true; /* stat 行同步显示 */
+            s_dbg_abs_off_ms = 0; /* 新时基清零纠偏 */
+            ESP_LOGI(TAG, "timing mode -> wall-clock (SNTP synced, off=%ldms, ts=%lu)", /* 日志: 模式切换 */
+                     (long)s_ntp_offset_ms, (unsigned long)ts);
+        }
+
         /* late_ms: 该包相对"应写入 DMA 的时刻"的偏移 (ms); >0 落后, <0 超前 */
         int32_t late_ms;
         if (use_wall) { /* 发送端 ts 是墙钟且 SNTP 已同步: 多设备同一时刻播同一帧 */
             int32_t diff = (int32_t)(wall_rtp_now() - ts); /* 32bit 有符号差值, 自动处理回绕 */
-            late_ms = diff / 48 + I2S_DMA_DEPTH_MS - PLAYOUT_LEAD_MS + abs_off_ms;
+            late_ms = diff / 48 + I2S_DMA_DEPTH_MS - PLAYOUT_LEAD_MS + s_dbg_abs_off_ms;
         } else { /* 发送端 ts 非墙钟(实测是开机采样计数): 本地锚定相对播放, 保证本机连续出声 */
             int64_t now_ms = (esp_timer_get_time() - anchor_us) / 1000;
             int64_t due_ms = (int64_t)((int32_t)(ts - anchor_ts)) / 48;
             late_ms = (int32_t)(now_ms - due_ms) + I2S_DMA_DEPTH_MS - PLAYOUT_LEAD_MS;
         }
         s_dbg_late_ms = late_ms;   /* 供 stat 日志诊断 */
+        if (late_ms < s_dbg_late_min) s_dbg_late_min = late_ms; /* 统计窗内最小 late (超前程度) */
+        if (late_ms > s_dbg_late_max) s_dbg_late_max = late_ms; /* 统计窗内最大 late (落后程度) */
 
         if (late_ms < -500) { /* 时基跳变: sender 重启/换曲/大段跳包后 ts 起点变化 → 重锚定 */
+            s_stats.late_jump++; /* 统计: 时基跳变次数 (发端 ts 基准突变) */
             if (use_wall) {
-                abs_off_ms += -late_ms;
+                s_dbg_abs_off_ms += -late_ms; /* 绝对模式: 一次性抵消跳变 */
             } else {
                 anchor_ts = ts;
                 anchor_us = esp_timer_get_time();
             }
-            ESP_LOGW(TAG, "timebase jumped (late=%dms), re-anchored", (int)late_ms);
+            ESP_LOGW(TAG, "timebase jumped (ts=%lu late=%ldms mode=%s), re-anchored", /* 日志: 发端时间戳基准跳变 */
+                     (unsigned long)ts, (long)late_ms, use_wall ? "wall" : "anchor");
             continue;
         }
 
         if (late_ms > LATE_DROP_MS) { /* 落后超过缓冲垫: 丢掉这个包, 不能把延迟永久推后 */
             s_stats.missed++;
+            s_stats.late_drop++; /* 统计: 因时间戳落后被丢弃的帧 */
+            /* 限速告警 (每 500ms 最多一条): 明确指出"收到包但时间不一致被丢", 用于区分无声原因 */
+            static int64_t s_last_late_log_us;
+            int64_t now_us = esp_timer_get_time();
+            if (now_us - s_last_late_log_us > 500000) {
+                s_last_late_log_us = now_us;
+                ESP_LOGW(TAG, "late drop: ts=%lu late=%ldms mode=%s off=%ldms ring=%lu (audio ts mismatch)", /* 日志 */
+                         (unsigned long)ts, (long)late_ms, use_wall ? "wall" : "anchor", /* 包 ts / 落后量 / 模式 */
+                         (long)s_ntp_offset_ms, (unsigned long)ring_pkt_cnt()); /* 墙钟-发端 ts / 积压 */
+            }
             if (late_ms > 250) { /* 严重滞后(时基错/发送端偏快): 清积压后用最新包重建时基 */
+                s_stats.late_fix++; /* 统计: 强制重建次数 */
                 int guard = 0;
                 while (ring_pkt_cnt() > 1 && guard++ < (int)RING_PKTS) {
                     if (!ring_pop(out)) break;
@@ -1074,7 +1282,7 @@ static void i2s_task(void *arg) /* I2S 播放任务: 从环形缓冲取包写 I2
                     uint32_t nts = *(uint32_t *)out;
                     if (nts != 0) {
                         if (use_wall) {
-                            abs_off_ms -= late_ms;   /* 绝对模式: 把累积偏差一次性抵消 */
+                            s_dbg_abs_off_ms -= late_ms; /* 绝对模式: 把累积偏差一次性抵消 */
                         } else {
                             anchor_ts = nts;         /* 本地模式: 直接重锚定 */
                             anchor_us = esp_timer_get_time();
