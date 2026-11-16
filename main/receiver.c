@@ -7,7 +7,7 @@
  *     seq/ts/ssrc 网络序
  *   - 1ms 数据包: 每包 48 帧 @48kHz x 1 声道 x 32bit(4字节小端) = 192B 载荷,
  *     总长 204B (RTP头12+载荷192) 小于 MTU 不分片
- *   - 批量数据包 (v1.3): 载荷 = B 个连续 1ms 载荷拼接 (B=2~4, 384/576/768B),
+ *   - 批量数据包 (v1.3): 载荷 = B 个连续 1ms 载荷拼接 (B=2~7, 最大 1344B / 336 帧),
  *     包 ts 为首帧墙钟, 每包 ts 增量 = 48 x B; 接收端按 1ms 拆帧入环,
  *     因 due 调度逐帧判定, 量化误差无感
  *   - FEC: 1ms 流每 10 包异或生成 1 个校验包 (N=10); 批量流每 5 包 1 个 (N=5,
@@ -89,12 +89,12 @@
 #define FEC_N          10                 /* 1ms 流: 每 FEC_N 个数据包生成 1 个 XOR 校验包 */
 #define RTP_PT         96                 /* 1ms 数据包 PT */
 #define RTP_PT_FEC     97                 /* 1ms FEC 包 PT */
-/* ---- v1.3 批量流 (2~4ms/包) ---- */
+/* ---- v1.3 批量流 (1~7ms/包) ---- */
 #define RTP_PT_BATCH     100              /* 批量数据包 PT */
 #define RTP_PT_BATCH_FEC 101              /* 批量 FEC 包 PT */
-#define BATCH_MAX_B      4                /* 单包最大 4ms (4 x 48 帧) */
+#define BATCH_MAX_B      7                /* 单包最大 7ms (7 x 48 = 336 帧, 载荷 1344B, 含 RTP 头 1356B < 1400 不分片) */
 #define FEC_N_BATCH      5                /* 批量流 FEC 组大小: 恢复窗口 5 x B ms */
-#define BATCH_MAX_PAYLOAD (PAYLOAD_LEN * BATCH_MAX_B) /* 批量载荷上限 = 768B */
+#define BATCH_MAX_PAYLOAD (PAYLOAD_LEN * BATCH_MAX_B) /* 批量载荷上限 = 1344B (336 帧) */
 #define SSRC           0x7C41 /* 本系统流的同步源标识, 用于过滤其他流 */
 
 /* ---------- 调试开关 ---------- */
@@ -115,7 +115,7 @@
 /* ---------- FEC 缓存 / 环形缓冲参数 ---------- */
 #define FEC_CACHE_SZ   58                 /* 包缓存槽数, 必须覆盖 水位+FEC组+突发 (48+10+余量);
                                             20 槽时 drain 落后 >20 包会被 hash 同槽覆盖, 造成额外假丢包.
-                                            每槽 ~0.8KB (批量包 768B), 整体放 PSRAM */
+                                            每槽 ~1.4KB (批量包 1344B), 58 槽约 79KB, 整体放 PSRAM */
 #define FEC_GROUP_REC  8                  /* 记录最近 FEC 组状态 (80ms 窗口) */
 #define RING_PKTS      160                /* 环形缓冲容量: 160 包 = 160ms (给丢包/突发留足余量, 正常不靠它控延迟) */
 #define TARGET_WMARK   48                 /* 起播水位: 攒够 48 包(48ms)再起播, 这就是抖动缓冲垫;
@@ -190,9 +190,9 @@ static volatile int64_t s_last_rx_us = 0;
 typedef struct { /* FEC 缓存槽: 按 seq 散列缓存最近收到的数据包 */
     uint16_t seq; /* 缓存包的 RTP 序号 */
     bool     valid; /* 槽位有效标志 */
-    uint16_t len; /* 载荷字节数: 192=1ms 包 / 384~768=批量包 */
+    uint16_t len; /* 载荷字节数: 192=1ms 包 / 192 的倍数 (最大 1344)=批量包 */
     uint32_t ts; /* sender 的 RTP ts (wall_ms × 48), 用于绝对墙钟定时 */
-    uint8_t  data[BATCH_MAX_PAYLOAD]; /* 完整载荷 (1ms 192B / 批量最多 768B) */
+    uint8_t  data[BATCH_MAX_PAYLOAD]; /* 完整载荷 (1ms 192B / 批量最多 1344B) */
 } pkt_cache_t; /* 缓存槽类型定义结束 */
 
 static pkt_cache_t *s_cache;             /* FEC 包缓存 (FEC_CACHE_SZ 槽, app_main 中分配到 PSRAM) */
@@ -209,7 +209,7 @@ static fec_group_state_t s_fec_groups[FEC_GROUP_REC]; /* 最近 FEC 组状态环
 static uint16_t s_last_played = 0; /* 已播放到的最大包 seq */
 static bool     s_has_last    = false; /* 是否已确定播放起点 */
 static uint32_t s_last_ts     = 0; /* 最后入队包的时间戳 (静音包据此合成单调递增 ts, 保证时间轴不被静音打断) */
-static uint8_t  s_batch_b     = 1; /* 当前流每包毫秒数: 1=1ms 流 / 2~4=批量流 (按最近收到的数据包学习) */
+static uint8_t  s_batch_b     = 1; /* 当前流每包毫秒数: 1=1ms 流 / 2~7=批量流 (按最近收到的数据包学习) */
 
 /* seq 回绕安全比较 (窗口远小于 32768) */
 static int16_t seq_diff(uint16_t a, uint16_t b) { return (int16_t)(a - b); } /* 回绕安全差值: uint16 相减转 int16 判正负 */
@@ -220,7 +220,7 @@ static void cache_put(uint16_t seq, uint32_t ts, const uint8_t *payload, uint16_
 { /* 函数体开始 */
     int idx = seq % FEC_CACHE_SZ; /* 散列槽号: seq 对槽数取模 */
     s_cache[idx].seq   = seq; /* 记录序号 */
-    s_cache[idx].len   = len; /* 记录载荷长度 (192 / 批量 384~768) */
+    s_cache[idx].len   = len; /* 记录载荷长度 (192 / 批量 192 的倍数, 最大 1344) */
     s_cache[idx].ts    = ts;  /* 记录 sender 的 RTP ts (wall_ms × 48) */
     s_cache[idx].valid = true; /* 标记槽有效 */
     memcpy(s_cache[idx].data, payload, len); /* 拷贝完整载荷到缓存槽 */
@@ -472,7 +472,7 @@ static bool deliver_silence(uint32_t ts) /* 向环形缓冲推入 1ms 静音 (�
 } /* 函数结束 */
 
 /* 单播单声道流: 从缓存包取出 ts + payload, 一起 push 到 ring 供 i2s_task 绝对墙钟定时;
- * 批量包 (B=2~4) 按 1ms 拆帧入环, 帧 ts = 包 ts + 帧序 x 48, due 调度逐帧判定 */
+ * 批量包 (B=2~7) 按 1ms 拆帧入环, 帧 ts = 包 ts + 帧序 x 48, due 调度逐帧判定 */
 static bool deliver_pkt(pkt_cache_t *p) /* 将缓存包交付给环形缓冲; 返回 false=ring 满未入队 */
 { /* 函数体开始 */
     uint8_t buf[sizeof(uint32_t) + PAYLOAD_LEN]; /* [ts(4B) + 1ms payload(192B)] */
@@ -495,8 +495,8 @@ static bool deliver_pkt(pkt_cache_t *p) /* 将缓存包交付给环形缓冲; �
  * 批量流载荷 B x 192B, 包间 ts 增量 = 48 x B */
 static void handle_fec(uint16_t fec_seq, const uint8_t *fec_data, uint16_t fec_len, uint8_t n) /* 处理 FEC 校验包: 异或还原窗口内丢失的 1 个数据包 */
 { /* 函数体开始 */
-    uint8_t xor_buf[BATCH_MAX_PAYLOAD]; /* 异或累加缓冲区 (最大 768 字节) */
-    uint8_t b = (uint8_t)(fec_len / PAYLOAD_LEN); /* 每包毫秒数: 1=1ms 流 / 2~4=批量流 */
+    uint8_t xor_buf[BATCH_MAX_PAYLOAD]; /* 异或累加缓冲区 (最大 1344 字节) */
+    uint8_t b = (uint8_t)(fec_len / PAYLOAD_LEN); /* 每包毫秒数: 1=1ms 流 / 2~7=批量流 */
     if (b == 0) return; /* 长度异常: 忽略 */
     memset(xor_buf, 0, fec_len); /* 异或缓冲清零 */
     int      cnt     = 0; /* 已收集到的数据包计数 */
@@ -809,7 +809,7 @@ static void network_task(void *arg) /* 网络接收任务: 收 RTP 数据包/FEC
             vTaskDelay(pdMS_TO_TICKS(1000)); /* 每 1s 轮询一次 IP */
         } /* 等待 IP + bind 成功循环结束 (此时 sock >= 0) */
 
-        uint8_t pkt[RTP_HDR_LEN + BATCH_MAX_PAYLOAD]; /* 接收缓冲区: RTP 头 + 最大载荷 (批量 768B) */
+        uint8_t pkt[RTP_HDR_LEN + BATCH_MAX_PAYLOAD]; /* 接收缓冲区: RTP 头 + 最大载荷 (批量 1344B, 总长 1356B < 1400) */
         struct sockaddr_in from; /* 发送方地址结构 */
         socklen_t fromlen = sizeof(from); /* 地址结构长度 */
 
@@ -849,7 +849,7 @@ static void network_task(void *arg) /* 网络接收任务: 收 RTP 数据包/FEC
             } /* SNTP 触发分支结束 */
 
             if (hdr->pt == RTP_PT || hdr->pt == RTP_PT_BATCH) { /* 数据包 (pt=96 1ms / 100 批量) */
-                uint8_t b = (uint8_t)(plen / PAYLOAD_LEN); /* 本包毫秒数: 1 / 2~4 */
+                uint8_t b = (uint8_t)(plen / PAYLOAD_LEN); /* 本包毫秒数: 1 / 2~7 */
                 if (hdr->pt == RTP_PT && b != 1) { s_stats.rx_badlen++; continue; } /* pt=96 必须是 192B */
                 s_batch_b = b; /* 学习当前流每包毫秒数 (缺包补静音/恢复窗口据此计算) */
                 if (hdr->pt == RTP_PT) s_stats.rx_data++; else s_stats.rx_batch++; /* 分别计数 96/100 */
