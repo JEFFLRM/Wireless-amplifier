@@ -1272,7 +1272,11 @@ static void i2s_task(void *arg) /* I2S 播放任务: 从环形缓冲取包写 I2
                          (unsigned long)ts, (long)late_ms, use_wall ? "wall" : "anchor", /* 包 ts / 落后量 / 模式 */
                          (long)s_ntp_offset_ms, (unsigned long)ring_pkt_cnt()); /* 墙钟-发端 ts / 积压 */
             }
-            if (late_ms > 250) { /* 严重滞后(时基错/发送端偏快): 清积压后用最新包重建时基 */
+            /* 本地锚定模式下, 发端 ts 速率与本机时钟存在微小偏差 (实测 ~0.02%),
+             * 累积后 late 会稳定卡在 LATE_DROP_MS 之上且永不回落 → 持续丢包直到无声.
+             * 因此 anchor 模式把重锚定阈值降到 100ms (网络抖动实测 ≤44ms, 不会误触发);
+             * wall 模式仍用 250ms, 避免与墙钟纠偏互相打架 */
+            if (late_ms > (use_wall ? 250 : 100)) { /* 严重滞后(时基错/发送端偏快): 清积压后用最新包重建时基 */
                 s_stats.late_fix++; /* 统计: 强制重建次数 */
                 int guard = 0;
                 while (ring_pkt_cnt() > 1 && guard++ < (int)RING_PKTS) {
