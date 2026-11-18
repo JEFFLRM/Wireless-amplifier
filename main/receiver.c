@@ -374,6 +374,9 @@ static volatile int32_t  s_dbg_late_max;      /* 统计窗内 late 最大值 (�
 static volatile bool     s_dbg_use_wall;      /* 当前定时模式: true=绝对墙钟 / false=本地锚定 */
 static volatile int32_t  s_dbg_abs_off_ms;    /* 绝对模式下的纠偏偏移 (ms) */
 static volatile uint32_t s_dbg_ring_pkts;
+static volatile uint32_t s_dbg_rx_ts;         /* 最近一个数据包的 RTP ts (诊断: 折算发端时刻) */
+static volatile uint32_t s_wifi_disc_cnt;     /* 累计断连次数 (link 诊断: 增长=链路不稳) */
+static volatile uint8_t  s_wifi_last_reason;  /* 最近一次断连原因码 (wifi_err_reason_t) */
 
 /* 当前绝对墙钟折算为 48kHz RTP 时钟 (32bit, 约 24.8h 回绕);
  * sender/receiver 经 SNTP 对齐后同一时刻值相同, 用于多设备同步定时 */
@@ -859,6 +862,7 @@ static void network_task(void *arg) /* 网络接收任务: 收 RTP 数据包/FEC
                     continue; /* 丢弃重复包 */
                 } /* 重复分支结束 */
                 uint32_t ts = ntohl(hdr->ts); /* sender 的 RTP ts (wall_ms × 48) */
+                s_dbg_rx_ts = ts; /* 记录发端 ts, 供 stat 任务折算成发端时刻打印 */
                 if (time_is_synced()) { /* 已对时: 采样"墙钟 - 发端 ts", 用于判断发端是否也按 NTP 打时间戳 */
                     int32_t d_ms = (int32_t)(wall_rtp_now() - ts) / 48; /* ms, 32bit 差值自动处理回绕 */
                     s_ntp_offset_ms = (d_ms + 3 * s_ntp_offset_ms) / 4; /* EMA 平滑, 抑制单包网络抖动 */
@@ -884,15 +888,17 @@ static void stat_task(void *arg) /* 运行统计打印任务: 独立于收包循
         vTaskDelay(pdMS_TO_TICKS(5000)); /* 每 5 秒打印一次 */
         bool synced = time_is_synced(); /* 方案 A §F3: 对时状态 */
         char wall[16] = "--:--:--"; /* 本地墙钟 HH:MM:SS (未对时显示占位, 避免 1970 误导) */
+        long wall_ms = 0; /* 本地墙钟毫秒部分 */
         if (synced) { /* 已对时: 格式化当前墙钟 */
             struct timeval tv; /* 当前墙钟 */
             struct tm tm_now; /* 拆分后的时分秒 */
             gettimeofday(&tv, NULL); /* 取 NTP 时间 */
+            wall_ms = (long)(tv.tv_usec / 1000); /* 毫秒 */
             if (localtime_r(&tv.tv_sec, &tm_now) != NULL) { /* 转本地时间 */
                 strftime(wall, sizeof(wall), "%H:%M:%S", &tm_now); /* 只打印时分秒, 行长可控 */
             } /* 转换成功分支结束 */
         } /* 对时分支结束 */
-        ESP_LOGI(TAG, "stat: rx=%lu fec=%lu rec=%lu fecbad=%lu miss=%lu late_drop=%lu jump=%lu fix=%lu drop=%lu under=%lu bad_ssrc=%lu short=%lu badlen=%lu pt100=%lu/%lu miss100=%lu late=%ld/%ld/%ldms ring=%lu mode=%s synced=%d ntp=%s syncs=%lu wall=%s off=%ldms abs_off=%ldms", /* 日志: 收/校/恢/坏组/缺/落后丢/跳变/强制重建/丢/欠载/非法SSRC/短包/长度异常/批量收包/批量FEC/批量缺帧/late(末/最小/最大)/ring/定时模式/对时状态/授时server/对时次数/墙钟/偏差/绝对纠偏 */
+        ESP_LOGI(TAG, "stat: rx=%lu fec=%lu rec=%lu fecbad=%lu miss=%lu late_drop=%lu jump=%lu fix=%lu drop=%lu under=%lu bad_ssrc=%lu short=%lu badlen=%lu pt100=%lu/%lu miss100=%lu late=%ld/%ld/%ldms ring=%lu mode=%s synced=%d ntp=%s syncs=%lu wall=%s.%03ld off=%ldms abs_off=%ldms", /* 日志: 收/校/恢/坏组/缺/落后丢/跳变/强制重建/丢/欠载/非法SSRC/短包/长度异常/批量收包/批量FEC/批量缺帧/late(末/最小/最大)/ring/定时模式/对时状态/授时server/对时次数/墙钟(含毫秒)/偏差/绝对纠偏 */
                  (unsigned long)s_stats.rx_data, (unsigned long)s_stats.rx_fec, /* 数据包与 FEC 包计数 */
                  (unsigned long)s_stats.recovered, (unsigned long)s_stats.fec_bad, /* 恢复数与不可恢复组数 */
                  (unsigned long)s_stats.missed, /* 静音补缺计数 (ms) */
@@ -906,7 +912,52 @@ static void stat_task(void *arg) /* 运行统计打印任务: 独立于收包循
                  (long)s_dbg_late_ms, (long)s_dbg_late_min, (long)s_dbg_late_max, /* late 末值/窗内最小/窗内最大 */
                  (unsigned long)ring_pkt_cnt(), s_dbg_use_wall ? "wall" : "anchor", /* ring 深度 / 当前定时模式 */
                  (int)synced, s_sntp_server, (unsigned long)s_ntp_sync_cnt, /* 对时状态 / 当前 server / 成功次数 */
-                 wall, (long)s_ntp_offset_ms, (long)s_dbg_abs_off_ms); /* 墙钟 HH:MM:SS / 墙钟-发端 ts / 绝对纠偏 */
+                wall, wall_ms, (long)s_ntp_offset_ms, (long)s_dbg_abs_off_ms); /* 墙钟 HH:MM:SS.mmm / 墙钟-发端 ts / 绝对纠偏 */
+        /* 时间对照: 本地墙钟 vs 发端 RTP ts 折算的时刻 (直观判断两侧时基是否一致) */
+        { /* 独立作用域, 避免污染统计打印变量 */
+            struct timeval tv; /* 当前本地墙钟 (含毫秒) */
+            struct tm tm_loc; /* 本地时间拆分 */
+            char loc[32] = "--"; /* 本地时间字符串 (未对时保持占位) */
+            char snd[24] = "--:--:--"; /* 发端时刻字符串 (需容纳 "YYYY-MM-DD HH:MM:SS") */
+            long snd_ms = 0; /* 发端时刻毫秒部分 */
+            unsigned long rts = (unsigned long)s_dbg_rx_ts; /* 最近一包的发端 ts */
+            gettimeofday(&tv, NULL); /* 取本地墙钟 */
+            if (synced && localtime_r(&tv.tv_sec, &tm_loc) != NULL) { /* 已对时才有意义 */
+                strftime(loc, sizeof(loc), "%Y-%m-%d %H:%M:%S", &tm_loc); /* 完整日期时间 */
+            } /* 本地时间格式化结束 */
+            if (rts != 0 && synced) { /* 已收包且已对时: 32bit ts 就近还原成 64 位再折算 */
+                int64_t now_ts = (int64_t)tv.tv_sec * 48000 + (int64_t)tv.tv_usec * 48 / 1000; /* 64 位墙钟 tick (不能用 wall_rtp_now, 那个是 32 位回绕值) */
+                int32_t d32 = (int32_t)((uint32_t)rts - (uint32_t)now_ts); /* 与当前墙钟的整数差 (±12.4h 内) */
+                int64_t snd_ts = now_ts + d32; /* 还原后的 64 位发端时刻 */
+                time_t sec = (time_t)(snd_ts / 48000); /* 折算为秒 */
+                snd_ms = (long)((snd_ts - (int64_t)sec * 48000) / 48); /* 毫秒部分 */
+                struct tm tm_snd; /* 发端时刻拆分 */
+                if (localtime_r(&sec, &tm_snd) != NULL) { /* 转换成功 */
+                    strftime(snd, sizeof(snd), "%Y-%m-%d %H:%M:%S", &tm_snd); /* 带日期, 可直接和 local 逐位对比 */
+                } /* 发端时间格式化结束 */
+            } /* 发端时刻折算结束 */
+            ESP_LOGI(TAG, "time: local=%s.%03ld snd=%s.%03ld off=%ldms ts=%lu", /* 本地时刻 / 发端时刻 / 两侧偏差 / 原始ts */
+                     loc, (long)(tv.tv_usec / 1000), snd, snd_ms, (long)s_ntp_offset_ms, rts);
+        } /* 时间对照打印结束 */
+        /* 链路健康: WiFi 关联/信号/断连次数与原因/IP/堆余量 (失联问题定位用) */
+        { /* 独立作用域 */
+            wifi_ap_record_t ap; /* AP 信息 */
+            memset(&ap, 0, sizeof(ap)); /* 清零: 未关联时字段无意义 */
+            bool assoc = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK); /* 是否已关联 AP (false=WiFi 掉线) */
+            esp_netif_t *nif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"); /* STA netif */
+            esp_netif_ip_info_t ipi; /* 本机 IP/网关/掩码 */
+            memset(&ipi, 0, sizeof(ipi)); /* 清零: 无 IP 时显示 0.0.0.0 */
+            if (nif != NULL) esp_netif_get_ip_info(nif, &ipi); /* 读取当前 IP 配置 */
+            const unsigned char *ip = (const unsigned char *)&ipi.ip.addr; /* 按网络字节序取 4 字节 */
+            const unsigned char *gw = (const unsigned char *)&ipi.gw.addr; /* 网关 4 字节 */
+            ESP_LOGI(TAG, "link: wifi=%s rssi=%d ch=%u disc=%lu reason=%u ip=%u.%u.%u.%u gw=%u.%u.%u.%u int_heap=%u psram_heap=%u", /* 关联态/信号/信道/断连次数/原因码/IP/网关/内部堆/PSRAM堆 */
+                     assoc ? "up" : "DOWN", assoc ? ap.rssi : 0, assoc ? (unsigned)ap.primary : 0u, /* 未关联时信号与信道填 0 */
+                     (unsigned long)s_wifi_disc_cnt, (unsigned)s_wifi_last_reason, /* 累计断连次数 + 最近一次原因码 */
+                     (unsigned)ip[0], (unsigned)ip[1], (unsigned)ip[2], (unsigned)ip[3], /* 本机 IP */
+                     (unsigned)gw[0], (unsigned)gw[1], (unsigned)gw[2], (unsigned)gw[3], /* 网关 */
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), /* 内部 SRAM 剩余 */
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM)); /* PSRAM 剩余 */
+        } /* 链路健康打印结束 */
         s_dbg_late_min = 0; /* 重置统计窗最小值 */
         s_dbg_late_max = 0; /* 重置统计窗最大值 */
     } /* 打印循环结束 */
@@ -1403,6 +1454,8 @@ static void wifi_ip_event_handler(void *arg, esp_event_base_t event_base, /* 事
         switch (event_id) { /* 按事件类型处理 */
         case WIFI_EVENT_STA_DISCONNECTED: { /* STA 已从 AP 断开 */
             wifi_event_sta_disconnected_t *dis = (wifi_event_sta_disconnected_t *)event_data; /* 断连详情 */
+            s_wifi_disc_cnt++; /* 累计断连次数 (link 诊断) */
+            s_wifi_last_reason = dis->reason; /* 记录原因码, 供 link 行显示 */
             ESP_LOGW(TAG, "WiFi STA disconnected reason=%d, reconnecting...", dis->reason); /* 日志: 断开原因 */
             s_led_state = LED_ST_WIFI_RECONNECT; /* 切黄灯闪 (重连优先级最高) */
             esp_wifi_connect(); /* 显式调用 connect 立即启动重连, 避免等待内部退避 */
@@ -1613,6 +1666,8 @@ static void audio_out_init(bool full, uint16_t slot) /* 初始化 I2S 输出与 
 void app_main(void) /* 程序入口: 加载配置, 无配置则进 BLE 配网, 否则启动音频链路 */
 { /* 函数体开始 */
     /* 全局初始化 (仅一次): NVS / netif / event loop */
+    setenv("TZ", "CST-8", 1); /* 时区设为北京时间 (UTC+8, 无夏令时); 否则 localtime 输出 UTC */
+    tzset(); /* 使 TZ 立即生效, 后续日志/stat 的时间都是本地时间 */
     ESP_ERROR_CHECK(nvs_flash_init()); /* 初始化 NVS flash (配置存储) */
     ESP_ERROR_CHECK(esp_netif_init()); /* 初始化网络接口 */
     ESP_ERROR_CHECK(tcp_log_init(0));  /* TCP 远程日志: telnet/nc <ip> 3333 (不影响 USB 串口) */
