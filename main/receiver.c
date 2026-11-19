@@ -93,7 +93,8 @@
 #define RTP_PT_BATCH     100              /* 批量数据包 PT */
 #define RTP_PT_BATCH_FEC 101              /* 批量 FEC 包 PT */
 #define BATCH_MAX_B      7                /* 单包最大 7ms (7 x 48 = 336 帧, 载荷 1344B, 含 RTP 头 1356B < 1400 不分片) */
-#define FEC_N_BATCH      5                /* 批量流 FEC 组大小: 恢复窗口 5 x B ms */
+#define FEC_N_BATCH      7                /* 批量流 FEC 组大小: 恢复窗口 7 x B ms;
+                                          *  覆盖连续丢 2 个包的概率 (XOR 只能救 1 个, 但窗口加大让 2 个丢包分散到不同组) */
 #define BATCH_MAX_PAYLOAD (PAYLOAD_LEN * BATCH_MAX_B) /* 批量载荷上限 = 1344B (336 帧) */
 #define SSRC           0x7C41 /* 本系统流的同步源标识, 用于过滤其他流 */
 
@@ -113,15 +114,15 @@
 #define I2S_GPIO_DOUT      GPIO_NUM_5      /* DAC DIN   */
 
 /* ---------- FEC 缓存 / 环形缓冲参数 ---------- */
-#define FEC_CACHE_SZ   58                 /* 包缓存槽数, 必须覆盖 水位+FEC组+突发 (48+10+余量);
-                                            20 槽时 drain 落后 >20 包会被 hash 同槽覆盖, 造成额外假丢包.
-                                            每槽 ~1.4KB (批量包 1344B), 58 槽约 79KB, 整体放 PSRAM */
+#define FEC_CACHE_SZ   58                 /* 包缓存槽数, 必须覆盖 水位+FEC组+突发 (15+7+余量);
+                                            *  每槽 ~1.4KB (批量包 1344B), 58 槽约 79KB, 整体放 PSRAM */
 #define FEC_GROUP_REC  8                  /* 记录最近 FEC 组状态 (80ms 窗口) */
-#define RING_PKTS      160                /* 环形缓冲容量: 160 包 = 160ms (给丢包/突发留足余量, 正常不靠它控延迟) */
-#define TARGET_WMARK   48                 /* 起播水位: 攒够 48 包(48ms)再起播, 这就是抖动缓冲垫;
-                                           * 之后收发都是 1 包/ms, 水位自然稳定在 48 附近 */
-#define RING_HIGH_PKTS 100                /* 积压上限: 突发/静音填充导致水位上涨超过该值 */
-#define RING_TRIM_PKTS 70                 /* 超限时丢最旧包回到该水位 (延迟回到 ~70+8ms) */
+#define RING_PKTS      160                /* 环形缓冲容量: 160 包 = 1120ms (7ms/包, 给丢包/突发留足余量) */
+#define TARGET_WMARK   15                 /* 起播水位 (包数, 1包=7ms):
+                                           *  端到端延迟 ≈ TARGET_WMARK × 7ms = 105ms */
+#define RING_HIGH_PKTS 18                 /* 积压上限 (包): started 前等 SNTP 对时期间, ring 积压超过该值就裁剪;
+                                           *  与 TRIM 差 3 包 (=21ms < LATE_DROP_MS=25ms), 否则到 HIGH 那一刻会触发 late drop */
+#define RING_TRIM_PKTS 15                 /* 裁剪回水位 (包): 起播那一刻 ring 积压 = 15 包, 延迟 = 105ms */
 
 /* ---------- 定时播出参数 ---------- */
 /* 播放时钟: late_ms = (时钟 - ts) + DMA - PLAYOUT_LEAD
@@ -129,8 +130,9 @@
  * 关键: i2s 绝不主动等待 —— 写入 DMA 满时自然阻塞 ≈1ms, 本身就是 1 包/ms 的节拍器;
  * 之前在 i2s 里 vTaskDelay 等待会让消费端停摆 → ring 塞满 → drain 无法推进 →
  * 缓存被新包覆盖 → 每秒几十次 "gap too large" 跳包 (音频完全错乱). */
-#define PLAYOUT_LEAD_MS   100             /* 播放延迟 (ms): 包从 ts 到出声的目标延迟 (须 >= 水位+DMA, 否则全部判"迟到")
-                                           * 本地锚定模式下它只是偏移量, 留大些以免误判; 墙钟模式即真实播出延迟 */
+#define PLAYOUT_LEAD_MS   113             /* 播放延迟基准 (ms): 稳态 ring 积压 15 包时 late=0;
+                                           *  = TARGET_WMARK×7ms + DMA(8ms) = 105+8 = 113ms, 对齐端到端延迟;
+                                           *  裁剪触发时积压 18 包 → late = 3×7 = 21ms < LATE_DROP_MS(25), 不会误丢 */
 #define I2S_DMA_DEPTH_MS  8               /* DMA 深度 (4×96帧 = 384帧 = 8ms), 纠偏时补偿 */
 #define LATE_DROP_MS      25              /* 比播出时刻晚 >25ms 才丢该包 (水位正常时不丢) */
 #define DRAIN_FILL_MAX    16              /* 单次排水最多补多少个静音 (保证缺包后几 ms 内追上最新包) */
@@ -591,7 +593,7 @@ static void drain_pkts(void) /* 排水: 尽量按 seq 顺序从缓存交付可�
         } /* FEC 覆盖分支结束 */
 
         /* 超时保护: next 落后于缓存最新包超过 FEC 组大小, 说明永远等不到, 静音推进 */
-        const int fec_win = (s_batch_b > 1) ? FEC_N_BATCH : FEC_N; /* 批量流恢复窗口按 5 包算 */
+        const int fec_win = (s_batch_b > 1) ? FEC_N_BATCH : FEC_N; /* 批量流恢复窗口按 7 包算 */
         uint16_t newest = 0; /* 下一包缺失且未被 FEC 覆盖: 判断是否已落后过多 */
         bool     has_new = false; /* 缓存中最新的 seq */
         for (int i = 0; i < FEC_CACHE_SZ; i++) { /* 是否找到有效包 */
@@ -873,7 +875,7 @@ static void network_task(void *arg) /* 网络接收任务: 收 RTP 数据包/FEC
                 bool batch_fec = (hdr->pt == RTP_PT_BATCH_FEC); /* 是否批量流 FEC */
                 if (!batch_fec && plen != PAYLOAD_LEN) { s_stats.rx_badlen++; continue; } /* pt=97 必须是 192B */
                 if (batch_fec) s_stats.rx_batch_fec++; else s_stats.rx_fec++; /* 分别计数 97/101 */
-                handle_fec(seq, payload, (uint16_t)plen, batch_fec ? FEC_N_BATCH : FEC_N); /* 窗口: 批量 N=5 / 1ms N=10 */
+                handle_fec(seq, payload, (uint16_t)plen, batch_fec ? FEC_N_BATCH : FEC_N); /* 窗口: 批量 N=7 / 1ms N=10 */
                 drain_pkts(); /* 尝试异或恢复缺失数据包 */
             } /* 恢复后再次排水 */
         } /* 收包循环结束 */
@@ -1352,7 +1354,7 @@ static void i2s_task(void *arg) /* I2S 播放任务: 从环形缓冲取包写 I2
         }
 
         /* 超前(late<0)直接播, 不等待: I2S DMA 写满自然阻塞 ≈1ms, 它本身就是 1 包/ms 节拍器.
-         * 缓冲垫由起播水位(24 包)建立, 不靠在这里等待 (等待会饿死消费端). */
+         * 缓冲垫由起播水位(15 包 = 105ms)建立, 不靠在这里等待 (等待会饿死消费端). */
 
         /* 注: 缺口静音由 drain_pkts() 在入队时统一补齐(且不会把延迟推后),
          * 这里不再按 ts 差二次补静音, 否则大跳包后会重复补几十 ms, 延迟累积. */
