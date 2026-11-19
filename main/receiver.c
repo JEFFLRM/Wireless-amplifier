@@ -63,6 +63,7 @@
 #include "esp_netif.h" /* 网络接口 (netif) */
 #include "esp_event.h" /* 事件循环 */
 #include "nvs_flash.h" /* NVS flash 存储 (配置持久化) */
+#include "nvs.h" /* NVS 读写 API (nvs_open/nvs_get_i32/nvs_set_i32: 播放参数持久化) */
 #include "lwip/sockets.h" /* LWIP socket (UDP 单播收包) */
 #include "lwip/inet.h" /* LWIP 网络字节序与地址转换 (ntohs/htonl/inet_addr) */
 #include "driver/gpio.h" /* GPIO 驱动 (BOOT 键输入) */
@@ -113,33 +114,47 @@
 #define I2S_GPIO_WS        GPIO_NUM_4      /* DAC LRCK  */
 #define I2S_GPIO_DOUT      GPIO_NUM_5      /* DAC DIN   */
 
-/* ---------- FEC 缓存 / 环形缓冲参数 ---------- */
-#define FEC_CACHE_SZ   58                 /* 包缓存槽数, 必须覆盖 水位+FEC组+突发 (15+7+余量);
-                                            *  每槽 ~1.4KB (批量包 1344B), 58 槽约 79KB, 整体放 PSRAM */
-#define FEC_GROUP_REC  8                  /* 记录最近 FEC 组状态 (80ms 窗口) */
-#define RING_PKTS      160                /* 环形缓冲容量: 160 包 = 1120ms (7ms/包, 给丢包/突发留足余量) */
-#define TARGET_WMARK   15                 /* 起播水位 (包数, 1包=7ms):
-                                           *  端到端延迟 ≈ TARGET_WMARK × 7ms = 105ms */
-#define RING_HIGH_PKTS 18                 /* 积压上限 (包): started 前等 SNTP 对时期间, ring 积压超过该值就裁剪;
-                                           *  与 TRIM 差 3 包 (=21ms < LATE_DROP_MS=25ms), 否则到 HIGH 那一刻会触发 late drop */
-#define RING_TRIM_PKTS 15                 /* 裁剪回水位 (包): 起播那一刻 ring 积压 = 15 包, 延迟 = 105ms */
+/* ---------- FEC 缓存 / 环形缓冲参数 (升级页面 /cfg 在线调整, 存 NVS "tune") ---------- */
+/* 以下全部参数都可在升级页面修改; 这里只是默认值.
+ * 标"重启生效"的参数在任务运行中改变会破坏已分配内存/硬件配置, 因此只写 NVS, 重启后加载. */
+#define DEF_FEC_CACHE_SZ   58             /* FEC 包缓存槽数默认值: 需覆盖 水位+FEC组+突发;
+                                           *  每槽 ~1.4KB (批量包 1344B), 58 槽约 79KB, 整体放 PSRAM */
+#define FEC_CACHE_SZ_MAX   256            /* 槽数上限 (256 × ~1.4KB ≈ 350KB, PSRAM 可承受) */
+#define DEF_FEC_GROUP_REC  8              /* 记录最近 FEC 组状态数默认值 (8 组 = 80ms 窗口) */
+#define FEC_GROUP_REC_MAX  32             /* 组记录上限 (32 组 = 320ms 窗口), 静态数组按此分配 */
+#define DEF_RING_PKTS      180            /* 环形缓冲容量 (帧): 环深, 改动需重启生效 */
+#define DEF_TARGET_WMARK   24             /* 起播水位 (帧): 攒够该帧数才起播, 就是抖动缓冲垫 */
+#define DEF_RING_HIGH_PKTS 48             /* 积压上限 (帧): 超过就裁剪, 防止延迟锁死 */
+#define DEF_RING_TRIM_PKTS 24             /* 裁剪回水位 (帧) */
+static int s_tune_cache_sz  = DEF_FEC_CACHE_SZ; /* 运行时值 (NVS 加载后覆盖; 改值需重启) */
+static int s_tune_group_rec = DEF_FEC_GROUP_REC; /* 运行时值 (NVS 加载后覆盖; 改值需重启) */
+static int s_tune_ring_pkts = DEF_RING_PKTS; /* 运行时值 (NVS 加载后覆盖) */
+static int s_tune_wmark     = DEF_TARGET_WMARK; /* 运行时值 */
+static int s_tune_high      = DEF_RING_HIGH_PKTS; /* 运行时值 */
+static int s_tune_trim      = DEF_RING_TRIM_PKTS; /* 运行时值 */
 
-/* ---------- 定时播出参数 ---------- */
-/* 播放时钟: late_ms = (时钟 - ts) + DMA - PLAYOUT_LEAD
+/* ---------- 定时播出参数 (升级页面 /cfg 在线调整, 存 NVS "tune") ---------- */
+/* 播放时钟: late_ms = (时钟 - ts) + DMA - 播放前瞻
  * 只用于判定"落后太多就丢该包", 以及时基跳变后重锚定.
  * 关键: i2s 绝不主动等待 —— 写入 DMA 满时自然阻塞 ≈1ms, 本身就是 1 包/ms 的节拍器;
  * 之前在 i2s 里 vTaskDelay 等待会让消费端停摆 → ring 塞满 → drain 无法推进 →
  * 缓存被新包覆盖 → 每秒几十次 "gap too large" 跳包 (音频完全错乱). */
-#define PLAYOUT_LEAD_MS   113             /* 播放延迟基准 (ms): 稳态 ring 积压 15 包时 late=0;
-                                           *  = TARGET_WMARK×7ms + DMA(8ms) = 105+8 = 113ms, 对齐端到端延迟;
-                                           *  裁剪触发时积压 18 包 → late = 3×7 = 21ms < LATE_DROP_MS(25), 不会误丢 */
-#define I2S_DMA_DEPTH_MS  8               /* DMA 深度 (4×96帧 = 384帧 = 8ms), 纠偏时补偿 */
-#define LATE_DROP_MS      25              /* 比播出时刻晚 >25ms 才丢该包 (水位正常时不丢) */
-#define DRAIN_FILL_MAX    16              /* 单次排水最多补多少个静音 (保证缺包后几 ms 内追上最新包) */
-#define GAP_JUMP_PKTS     32              /* 落后最新包超过该值就跳时间轴, 不再补几十 ms 静音 */
-#define TS_SANE_MS        2000            /* ts 与本地墙钟偏差超过 2s 视为发送端 ts 非墙钟, 回退本地锚定 */
-#define SYNC_WAIT_MS      10000           /* 起播前最长等待对时 (方案 A §F1 超时兜底): 超时降级为按 seq 播放 */
-#define NTP_SYNC_INTERVAL_MS 20000        /* NTP 刷新周期 20s (RFC4330 下限 15s); 压小多箱间晶振漂移 */
+#define DEF_PLAYOUT_LEAD_MS   148         /* 播放延迟基准默认值 (ms): 与水位保持固定关系 (20×7+8), 只影响 late 零点, 不影响实际延迟 */
+#define DEF_I2S_DMA_DEPTH_MS  8           /* DMA 深度默认值 (4×96帧 = 384帧 = 8ms), 纠偏时补偿; 改动需重启 */
+#define DEF_LATE_DROP_MS      25          /* 比播出时刻晚 >25ms 才丢该包 (水位正常时不丢) */
+#define DEF_DRAIN_FILL_MAX    16          /* 单次排水最多补多少个静音 (保证缺包后几 ms 内追上最新包) */
+#define DEF_GAP_JUMP_PKTS     32          /* 落后最新包超过该值就跳时间轴, 不再补几十 ms 静音 */
+#define DEF_TS_SANE_MS        2000        /* ts 与本地墙钟偏差超过 2s 视为发送端 ts 非墙钟, 回退本地锚定 */
+#define DEF_SYNC_WAIT_MS      10000       /* 起播前最长等待对时 (方案 A §F1 超时兜底): 超时降级为按 seq 播放 */
+#define DEF_NTP_INTERVAL_MS   20000       /* NTP 刷新周期 20s (RFC4330 下限 15s); 压小多箱间晶振漂移; 改动需重启 */
+static int s_tune_lead_ms    = DEF_PLAYOUT_LEAD_MS; /* 播放前瞻 (ms), 立即生效 */
+static int s_tune_dma_ms     = DEF_I2S_DMA_DEPTH_MS; /* I2S DMA 深度 (ms), 重启生效 */
+static int s_tune_late_drop  = DEF_LATE_DROP_MS;    /* 迟到丢弃阈值 (ms), 立即生效 */
+static int s_tune_drain_fill = DEF_DRAIN_FILL_MAX;  /* 排水静音上限 (帧), 立即生效 */
+static int s_tune_gap_jump   = DEF_GAP_JUMP_PKTS;   /* 缺口跳转阈值 (包), 立即生效 */
+static int s_tune_ts_sane_ms = DEF_TS_SANE_MS;      /* 墙钟判定容差 (ms), 立即生效 */
+static int s_tune_sync_wait_ms = DEF_SYNC_WAIT_MS;  /* 起播等对时上限 (ms), 下次起播生效 */
+static int s_tune_ntp_ms     = DEF_NTP_INTERVAL_MS; /* NTP 刷新周期 (ms), 重启/重建 SNTP 生效 */
 
 /* RTP 头 (与 sender.c 完全一致: 12 字节, packed) */
 typedef struct __attribute__((packed)) { /* RTP 固定头结构 (12 字节, 强制 1 字节对齐, 与 sender.c 完全一致) */
@@ -197,7 +212,7 @@ typedef struct { /* FEC 缓存槽: 按 seq 散列缓存最近收到的数据包 
     uint8_t  data[BATCH_MAX_PAYLOAD]; /* 完整载荷 (1ms 192B / 批量最多 1344B) */
 } pkt_cache_t; /* 缓存槽类型定义结束 */
 
-static pkt_cache_t *s_cache;             /* FEC 包缓存 (FEC_CACHE_SZ 槽, app_main 中分配到 PSRAM) */
+static pkt_cache_t *s_cache;             /* FEC 包缓存 (s_tune_cache_sz 槽, app_main 中按 NVS 参数分配到 PSRAM) */
 
 typedef struct { /* FEC 组状态记录: 标记某组是否已收到/可恢复 */
     uint16_t fec_seq;      /* FEC 包 seq */
@@ -206,7 +221,7 @@ typedef struct { /* FEC 组状态记录: 标记某组是否已收到/可恢复 *
     bool     valid; /* 记录有效标志 */
 } fec_group_state_t; /* 组状态类型定义结束 */
 
-static fec_group_state_t s_fec_groups[FEC_GROUP_REC]; /* 最近 FEC 组状态环形记录 (8 项, 80ms 窗口) */
+static fec_group_state_t s_fec_groups[FEC_GROUP_REC_MAX]; /* 最近 FEC 组状态环形记录 (按上限静态分配, 实际只用前 s_tune_group_rec 项) */
 
 static uint16_t s_last_played = 0; /* 已播放到的最大包 seq */
 static bool     s_has_last    = false; /* 是否已确定播放起点 */
@@ -220,7 +235,7 @@ static bool seq_lt(uint16_t a, uint16_t b) { return seq_diff(a, b) < 0; } /* 回
 
 static void cache_put(uint16_t seq, uint32_t ts, const uint8_t *payload, uint16_t len) /* 写入缓存槽: 按 seq 散列定位 */
 { /* 函数体开始 */
-    int idx = seq % FEC_CACHE_SZ; /* 散列槽号: seq 对槽数取模 */
+    int idx = seq % s_tune_cache_sz; /* 散列槽号: seq 对槽数取模 */
     s_cache[idx].seq   = seq; /* 记录序号 */
     s_cache[idx].len   = len; /* 记录载荷长度 (192 / 批量 192 的倍数, 最大 1344) */
     s_cache[idx].ts    = ts;  /* 记录 sender 的 RTP ts (wall_ms × 48) */
@@ -230,7 +245,7 @@ static void cache_put(uint16_t seq, uint32_t ts, const uint8_t *payload, uint16_
 
 static pkt_cache_t *cache_get(uint16_t seq) /* 查询缓存包: 槽有效且序号一致才命中 */
 { /* 函数体开始 */
-    int idx = seq % FEC_CACHE_SZ; /* 散列槽号 */
+    int idx = seq % s_tune_cache_sz; /* 散列槽号 */
     if (s_cache[idx].valid && s_cache[idx].seq == seq) { /* 校验槽有效且序号匹配 */
         return &s_cache[idx]; /* 命中则返回槽指针 */
     } /* 条件结束 */
@@ -239,7 +254,7 @@ static pkt_cache_t *cache_get(uint16_t seq) /* 查询缓存包: 槽有效且序�
 
 static void fec_group_set(uint16_t fec_seq, uint8_t state, uint8_t window) /* 记录 FEC 组状态 (收到校验包后标记) */
 { /* 函数体开始 */
-    int slot = fec_seq % FEC_GROUP_REC; /* 环形槽号: 按 FEC 包 seq 取模 */
+    int slot = fec_seq % s_tune_group_rec; /* 环形槽号: 按 FEC 包 seq 取模 */
     s_fec_groups[slot].fec_seq = fec_seq; /* 记录 FEC 包序号 */
     s_fec_groups[slot].state   = state; /* 记录组状态 */
     s_fec_groups[slot].window  = window; /* 记录组大小 (10 / 5) */
@@ -249,7 +264,7 @@ static void fec_group_set(uint16_t fec_seq, uint8_t state, uint8_t window) /* �
 /* 查询某个数据包 seq 是否已被某个已收到的 FEC 组覆盖 (已过恢复期) */
 static bool fec_group_covers(uint16_t seq, uint8_t *state_out) /* 查询某数据包 seq 是否已被已收到的 FEC 组覆盖 */
 { /* 函数体开始 */
-    for (int i = 0; i < FEC_GROUP_REC; i++) { /* 遍历全部组状态记录 */
+    for (int i = 0; i < s_tune_group_rec; i++) { /* 遍历全部组状态记录 */
         if (!s_fec_groups[i].valid) continue; /* 跳过无效记录 */
         uint16_t d = (uint16_t)(seq - s_fec_groups[i].fec_seq); /* 计算与 FEC 包的相对偏移 (uint16 回绕安全) */
         if (d >= 1 && d <= s_fec_groups[i].window) { /* 落在保护窗口 [1, N] 即被覆盖 */
@@ -445,7 +460,7 @@ static esp_err_t sntp_start_to(const char *server_ip) /* 启动 SNTP, server_ip 
     cfg.sync_cb = sntp_sync_cb; /* 通过 cfg 注册回调: esp_netif_sntp_init 会用该字段覆盖全局回调 */
     esp_err_t err = esp_netif_sntp_init(&cfg); /* 启动 SNTP */
     if (err == ESP_OK) { /* 成功 */
-        sntp_set_sync_interval(NTP_SYNC_INTERVAL_MS); /* 稳态刷新周期 20s (kconfig 默认 1h 太大) */
+        sntp_set_sync_interval(s_tune_ntp_ms); /* 稳态刷新周期 (默认 20s, kconfig 默认 1h 太大) */
         sntp_restart(); /* 立即生效并马上发首包, 不等 STARTUP_DELAY */
         s_sntp_init_done = true; /* 标记已 init */
         strncpy(s_sntp_server, server_ip, sizeof(s_sntp_server) - 1); /* 缓存 server IP (供 stat/回调打印) */
@@ -464,7 +479,7 @@ static bool ts_looks_wall(uint32_t ts)
 {
     if (!time_is_synced()) return false; /* SNTP 未同步: 墙钟不可信 */
     int32_t gap = (int32_t)(wall_rtp_now() - ts); /* 32bit 有符号差值, 自动处理回绕 */
-    return gap < TS_SANE_MS * 48 && gap > -TS_SANE_MS * 48;
+    return gap < s_tune_ts_sane_ms * 48 && gap > -s_tune_ts_sane_ms * 48;
 }
 
 static bool deliver_silence(uint32_t ts) /* 向环形缓冲推入 1ms 静音 (带合成 ts); 返回 false=ring 满 */
@@ -559,7 +574,7 @@ static void drain_pkts(void) /* 排水: 尽量按 seq 顺序从缓存交付可�
             /* 起始: 找缓存中最旧 seq 作为播放起点 */
             int      found   = -1; /* 最小包槽下标 (-1 表示未找到) */
             uint16_t min_seq = 0; /* 最小 seq 值 */
-            for (int i = 0; i < FEC_CACHE_SZ; i++) { /* 遍历全部缓存槽找最小 seq */
+            for (int i = 0; i < s_tune_cache_sz; i++) { /* 遍历全部缓存槽找最小 seq */
                 if (s_cache[i].valid && (found < 0 || seq_lt(s_cache[i].seq, min_seq))) { /* 找到有效且更小的包则更新候选 */
                     found   = i; /* 记录槽下标 */
                     min_seq = s_cache[i].seq; /* 记录最小 seq */
@@ -584,7 +599,7 @@ static void drain_pkts(void) /* 排水: 尽量按 seq 顺序从缓存交付可�
         if (fec_group_covers(next, &fstate)) { /* 已收 FEC 组覆盖该 seq (包确实发出但本机缺失) */
             /* 该缺口所在 FEC 组已收到: 若已恢复成功则上面 cache_get 会命中;
              * 到这里说明原包丢失且未能恢复, 静音推进 (批量流补齐 B ms, 不会堆积) */
-            if (sil++ >= DRAIN_FILL_MAX) break; /* 单次排水上限: 保证缺包后在几 ms 内追平最新包 */
+            if (sil++ >= s_tune_drain_fill) break; /* 单次排水上限: 保证缺包后在几 ms 内追平最新包 */
             if (!deliver_silence_n(frames)) break; /* ring 满则停, 绝不越过未入队的包推进进度 */
             s_last_played = next; /* 静音也推进播放进度 */
             s_stats.missed += (uint32_t)frames; /* 静音缺包计数 (按 ms 计) */
@@ -596,7 +611,7 @@ static void drain_pkts(void) /* 排水: 尽量按 seq 顺序从缓存交付可�
         const int fec_win = (s_batch_b > 1) ? FEC_N_BATCH : FEC_N; /* 批量流恢复窗口按 7 包算 */
         uint16_t newest = 0; /* 下一包缺失且未被 FEC 覆盖: 判断是否已落后过多 */
         bool     has_new = false; /* 缓存中最新的 seq */
-        for (int i = 0; i < FEC_CACHE_SZ; i++) { /* 是否找到有效包 */
+        for (int i = 0; i < s_tune_cache_sz; i++) { /* 是否找到有效包 */
             if (s_cache[i].valid && (!has_new || seq_gt(s_cache[i].seq, newest))) { /* 遍历缓存找最大 seq */
                 newest   = s_cache[i].seq; /* 更新最新 seq */
                 has_new  = true; /* 标记找到 */
@@ -607,7 +622,7 @@ static void drain_pkts(void) /* 排水: 尽量按 seq 顺序从缓存交付可�
             if (back < -2000) { /* 最新 seq 反而落后期望 seq 2000 以上: 发送端重启/换曲, seq 回绕到 0 */
                 /* 清空旧流缓存与 FEC 组状态, 重新锚定到新流起点;
                  * 否则会沿旧 seq 插几万包静音 (日志实测单次 +6.6 万 miss) */
-                memset(s_cache, 0, FEC_CACHE_SZ * sizeof(pkt_cache_t)); /* 清包缓存 (PSRAM) */
+                memset(s_cache, 0, (size_t)s_tune_cache_sz * sizeof(pkt_cache_t)); /* 清包缓存 (PSRAM) */
                 memset(s_fec_groups, 0, sizeof(s_fec_groups)); /* 清 FEC 组记录 */
                 s_has_last = false; /* 强制下次 drain 重新找起点 */
                 s_last_ts  = 0; /* 新流时间轴从头开始 */
@@ -615,14 +630,14 @@ static void drain_pkts(void) /* 排水: 尽量按 seq 顺序从缓存交付可�
                 break; /* 等新流数据包到达后重新锚定 */
             } /* 流重启分支结束 */
             if (back > fec_win) { /* 最新包已超过期望包一个 FEC 组以上: 确认该包已永远丢失 */
-                if (back > GAP_JUMP_PKTS) { /* 缺口太大: 逐包补静音会把播放永久推后几十 ms, 直接跳时间轴 */
+                if (back > s_tune_gap_jump) { /* 缺口太大: 逐包补静音会把播放永久推后几十 ms, 直接跳时间轴 */
                     s_stats.missed += (uint32_t)(back - 1) * (uint32_t)frames; /* 缺口计入缺包统计 (按 ms) */
                     if (s_batch_b > 1) s_stats.missed_batch += (uint32_t)(back - 1) * (uint32_t)frames; /* 批量流单列 */
                     s_last_played = (uint16_t)(newest - 1); /* 跳到最新包前一位, 下一轮即可命中 */
                     ESP_LOGW(TAG, "seq gap too large (%d pkt), skip to newest %u", (int)back, (unsigned)newest); /* 罕见事件, 允许打印 */
                     continue; /* 重新排水 (next=newest 应从缓存命中) */
                 } /* 大缺口跳转分支结束 */
-                if (sil++ >= DRAIN_FILL_MAX) break; /* 单次排水上限: 几 ms 内追平, 不长时间占用收包任务 */
+                if (sil++ >= s_tune_drain_fill) break; /* 单次排水上限: 几 ms 内追平, 不长时间占用收包任务 */
                 if (!deliver_silence_n(frames)) break; /* ring 满则停, 等 i2s 消耗 */
                 s_last_played = next; /* 推进播放进度 */
                 s_stats.missed += (uint32_t)frames; /* 缺包计数 (按 ms 计) */
@@ -1216,7 +1231,7 @@ static void i2s_task(void *arg) /* I2S 播放任务: 从环形缓冲取包写 I2
         if (s_tone_req && !ble_provision_is_connected()) { s_tone_req = false; }
 
         if (!started) { /* 等水位 + 等对时 (方案 A §F1-③ / §F2-4) */
-            if (ring_pkt_cnt() < TARGET_WMARK) { /* 水位不够 */
+            if (ring_pkt_cnt() < (uint32_t)s_tune_wmark) { /* 水位不够 */
                 sync_wait_us = 0; /* 没攒够包时不计对时等待 */
                 vTaskDelay(1); /* yield 给网络任务/IDLE, 不写静音 (避免 DMA 排队延迟) */
                 continue;
@@ -1225,14 +1240,14 @@ static void i2s_task(void *arg) /* I2S 播放任务: 从环形缓冲取包写 I2
              * 最多等 SYNC_WAIT_MS, 超时降级为本地锚定播放 (能出声但台间可能不同步) */
             if (!time_is_synced()) {
                 if (sync_wait_us == 0) sync_wait_us = esp_timer_get_time(); /* 开始计时 */
-                if (esp_timer_get_time() - sync_wait_us < (int64_t)SYNC_WAIT_MS * 1000) {
+                if (esp_timer_get_time() - sync_wait_us < (int64_t)s_tune_sync_wait_ms * 1000) {
                     vTaskDelay(1); /* 继续等对时, ring 继续积累 (上限由 RING_HIGH_PKTS 裁剪) */
                     continue;
                 }
                 if (!sync_timeout_logged) { /* 只告警一次 */
                     sync_timeout_logged = true;
                     ESP_LOGW(TAG, "SNTP 未在 %dms 内同步 (server=%s), 降级为本地锚定播放 (台间可能不同步)", /* 日志 */
-                             SYNC_WAIT_MS, s_sntp_server);
+                             s_tune_sync_wait_ms, s_sntp_server);
                 }
             }
             ring_pop(out); /* 先出队首包 (用于锚定) */
@@ -1245,7 +1260,7 @@ static void i2s_task(void *arg) /* I2S 播放任务: 从环形缓冲取包写 I2
             amp_play_once();
             ESP_LOGI(TAG, "playback start: first_ts=%lu mode=%s (DMA=%dms, lead=%dms, off=%ldms)", /* 日志: 起播模式与时间基准差 */
                      (unsigned long)anchor_ts, use_wall ? "wall-clock" : "local-anchor", /* 首包 ts / 定时模式 */
-                     I2S_DMA_DEPTH_MS, PLAYOUT_LEAD_MS, (long)s_ntp_offset_ms); /* DMA 深度 / 播放前瞻 / 墙钟-发端 ts */
+                     s_tune_dma_ms, s_tune_lead_ms, (long)s_ntp_offset_ms); /* DMA 深度 / 播放前瞻 / 墙钟-发端 ts */
             continue;
         }
 
@@ -1254,8 +1269,8 @@ static void i2s_task(void *arg) /* I2S 播放任务: 从环形缓冲取包写 I2
          * 超过 RING_HIGH_PKTS 就丢最旧包追赶到 RING_TRIM_PKTS, 把延迟拉回设计值. */
         {
             uint32_t n = ring_pkt_cnt(); /* 当前积压包数 */
-            if (n > (uint32_t)RING_HIGH_PKTS) { /* 积压过高 */
-                uint32_t drop = n - (uint32_t)RING_TRIM_PKTS; /* 需要丢弃的包数 */
+            if (n > (uint32_t)s_tune_high) { /* 积压过高 */
+                uint32_t drop = n - (uint32_t)s_tune_trim; /* 需要丢弃的包数 */
                 while (drop--) { /* 丢弃最旧包 */
                     if (!ring_pop(out)) break; /* 队列已空则停止 */
                     s_stats.missed++; /* 计入缺包 (这些包不会被播出) */
@@ -1290,11 +1305,11 @@ static void i2s_task(void *arg) /* I2S 播放任务: 从环形缓冲取包写 I2
         int32_t late_ms;
         if (use_wall) { /* 发送端 ts 是墙钟且 SNTP 已同步: 多设备同一时刻播同一帧 */
             int32_t diff = (int32_t)(wall_rtp_now() - ts); /* 32bit 有符号差值, 自动处理回绕 */
-            late_ms = diff / 48 + I2S_DMA_DEPTH_MS - PLAYOUT_LEAD_MS + s_dbg_abs_off_ms;
+            late_ms = diff / 48 + s_tune_dma_ms - s_tune_lead_ms + s_dbg_abs_off_ms;
         } else { /* 发送端 ts 非墙钟(实测是开机采样计数): 本地锚定相对播放, 保证本机连续出声 */
             int64_t now_ms = (esp_timer_get_time() - anchor_us) / 1000;
             int64_t due_ms = (int64_t)((int32_t)(ts - anchor_ts)) / 48;
-            late_ms = (int32_t)(now_ms - due_ms) + I2S_DMA_DEPTH_MS - PLAYOUT_LEAD_MS;
+            late_ms = (int32_t)(now_ms - due_ms) + s_tune_dma_ms - s_tune_lead_ms;
         }
         s_dbg_late_ms = late_ms;   /* 供 stat 日志诊断 */
         if (late_ms < s_dbg_late_min) s_dbg_late_min = late_ms; /* 统计窗内最小 late (超前程度) */
@@ -1313,7 +1328,7 @@ static void i2s_task(void *arg) /* I2S 播放任务: 从环形缓冲取包写 I2
             continue;
         }
 
-        if (late_ms > LATE_DROP_MS) { /* 落后超过缓冲垫: 丢掉这个包, 不能把延迟永久推后 */
+        if (late_ms > s_tune_late_drop) { /* 落后超过缓冲垫: 丢掉这个包, 不能把延迟永久推后 */
             s_stats.missed++;
             s_stats.late_drop++; /* 统计: 因时间戳落后被丢弃的帧 */
             /* 限速告警 (每 500ms 最多一条): 明确指出"收到包但时间不一致被丢", 用于区分无声原因 */
@@ -1332,7 +1347,7 @@ static void i2s_task(void *arg) /* I2S 播放任务: 从环形缓冲取包写 I2
             if (late_ms > (use_wall ? 250 : 100)) { /* 严重滞后(时基错/发送端偏快): 清积压后用最新包重建时基 */
                 s_stats.late_fix++; /* 统计: 强制重建次数 */
                 int guard = 0;
-                while (ring_pkt_cnt() > 1 && guard++ < (int)RING_PKTS) {
+                while (ring_pkt_cnt() > 1 && guard++ < s_tune_ring_pkts) {
                     if (!ring_pop(out)) break;
                 }
                 if (ring_pop(out)) { /* 取最新包 */
@@ -1567,8 +1582,11 @@ static void i2s_out_init(bool full, i2s_chan_handle_t *tx) /* I2S 输出初始�
     chan_cfg.auto_clear = true; /* 无数据时自动发零 */
     /* DMA 深度必须显式设置: I2S_CHANNEL_DEFAULT_CONFIG 默认 6 描述符 x 240 帧,
      * 48kHz / 32bit stereo 下 = 6 x 5ms = 30ms 缓冲, 直接把 <30ms 的延迟预算吃光.
-     * 这里 4 x 96 帧 = 384 帧 = 8ms, 与 I2S_DMA_DEPTH_MS 的纠偏窗口一致 */
-    chan_cfg.dma_desc_num  = 4; /* DMA 描述符个数 */
+     * 每个描述符 96 帧 = 2ms, 描述符数 = 页面配置的 DMA 深度(ms) / 2 (默认 8ms → 4 个) */
+    int dma_desc = s_tune_dma_ms / 2; /* 描述符个数: 2ms/个 */
+    if (dma_desc < 1)  dma_desc = 1;  /* 下限 */
+    if (dma_desc > 16) dma_desc = 16; /* 上限 (16 x 2ms = 32ms) */
+    chan_cfg.dma_desc_num  = (uint32_t)dma_desc; /* DMA 描述符个数 */
     chan_cfg.dma_frame_num = 96; /* 每个描述符 96 帧 (96 x 8B = 768B = 2ms) */
     ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, tx, NULL)); /* 创建 TX 通道 (无 RX) */
 
@@ -1664,6 +1682,170 @@ static void audio_out_init(bool full, uint16_t slot) /* 初始化 I2S 输出与 
     } /* 失败分支结束 */
 } /* 函数结束 */
 
+/* ============ 可调参数: FEC 缓存 / 环形缓冲 / 定时播出 (升级页面 /cfg, 存 NVS) ============ */
+#define TUNE_NVS_NS "tune" /* NVS 命名空间 */
+
+/* 范围校验与纠正 (保证内核不会因非法参数越界/死循环) */
+static void tuning_clamp(void)
+{
+    if (s_tune_group_rec < 2)  s_tune_group_rec = 2;  /* FEC 组记录下限 */
+    if (s_tune_group_rec > FEC_GROUP_REC_MAX) s_tune_group_rec = FEC_GROUP_REC_MAX;
+    if (s_tune_wmark < 4)   s_tune_wmark = 4;   /* 水位下限: 低于 4 帧完全没有抗抖动能力 */
+    if (s_tune_wmark > 160) s_tune_wmark = 160; /* 水位上限: 160ms 抖动垫 */
+    if (s_tune_high < s_tune_wmark + 1) s_tune_high = s_tune_wmark + 1; /* 上限必须高于水位, 否则一来包就裁剪 */
+    if (s_tune_high > 200)  s_tune_high = 200;
+    if (s_tune_trim < 1)    s_tune_trim = 1;    /* 裁剪目标下限 */
+    if (s_tune_trim > s_tune_high) s_tune_trim = s_tune_high;
+    if (s_tune_ring_pkts < s_tune_high + 8) s_tune_ring_pkts = s_tune_high + 8; /* 环深必须大于上限 */
+    if (s_tune_ring_pkts > 400) s_tune_ring_pkts = 400; /* 环深上限 (400 帧 × 1.4KB ≈ 560KB, 有 PSRAM 兜底) */
+    if (s_tune_cache_sz < s_tune_wmark + s_tune_group_rec + 8) /* 缓存必须覆盖 水位 + FEC 窗口 + 突发余量 */
+        s_tune_cache_sz = s_tune_wmark + s_tune_group_rec + 8;
+    if (s_tune_cache_sz > FEC_CACHE_SZ_MAX) s_tune_cache_sz = FEC_CACHE_SZ_MAX;
+    if (s_tune_lead_ms < 0)   s_tune_lead_ms = 0;   /* 播放前瞻 */
+    if (s_tune_lead_ms > 500) s_tune_lead_ms = 500;
+    if (s_tune_dma_ms < 2)    s_tune_dma_ms = 2;    /* DMA 深度: 每描述符 2ms */
+    if (s_tune_dma_ms > 32)   s_tune_dma_ms = 32;
+    s_tune_dma_ms &= ~1;                            /* 强制偶数, 便于换算描述符数 */
+    if (s_tune_late_drop < 1)   s_tune_late_drop = 1;
+    if (s_tune_late_drop > 200) s_tune_late_drop = 200;
+    if (s_tune_drain_fill < 1)   s_tune_drain_fill = 1;
+    if (s_tune_drain_fill > 500) s_tune_drain_fill = 500;
+    if (s_tune_gap_jump < 1)     s_tune_gap_jump = 1;
+    if (s_tune_gap_jump > 2000)  s_tune_gap_jump = 2000;
+    if (s_tune_ts_sane_ms < 100)   s_tune_ts_sane_ms = 100;
+    if (s_tune_ts_sane_ms > 600000) s_tune_ts_sane_ms = 600000;
+    if (s_tune_sync_wait_ms < 0)     s_tune_sync_wait_ms = 0;
+    if (s_tune_sync_wait_ms > 60000) s_tune_sync_wait_ms = 60000;
+    if (s_tune_ntp_ms < 15000)     s_tune_ntp_ms = 15000;     /* RFC4330 下限 15s */
+    if (s_tune_ntp_ms > 3600000)   s_tune_ntp_ms = 3600000;   /* 上限 1h */
+}
+
+/* 打印当前全部参数 (启动日志) */
+static void tuning_log(const char *tag)
+{
+    ESP_LOGI(TAG, "tuning %s: cache=%d group=%d wmark=%d high=%d trim=%d ring=%d | "
+             "lead=%dms dma=%dms late=%dms drain=%d gap=%d ts_sane=%dms sync_wait=%dms ntp=%dms",
+             tag, s_tune_cache_sz, s_tune_group_rec, s_tune_wmark, s_tune_high,
+             s_tune_trim, s_tune_ring_pkts, s_tune_lead_ms, s_tune_dma_ms,
+             s_tune_late_drop, s_tune_drain_fill, s_tune_gap_jump,
+             s_tune_ts_sane_ms, s_tune_sync_wait_ms, s_tune_ntp_ms);
+}
+
+/* 从 NVS 加载 (无记录则保留默认值) */
+static void tuning_load(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(TUNE_NVS_NS, NVS_READONLY, &h) != ESP_OK) { /* 首次运行: 没有该命名空间 */
+        tuning_log("default");
+        return;
+    }
+    int32_t v = 0;
+    /* FEC 缓存 / 环形缓冲 */
+    if (nvs_get_i32(h, "cache_sz", &v) == ESP_OK) s_tune_cache_sz  = (int)v;
+    if (nvs_get_i32(h, "group_rec", &v) == ESP_OK) s_tune_group_rec = (int)v;
+    if (nvs_get_i32(h, "ring",  &v) == ESP_OK) s_tune_ring_pkts = (int)v;
+    if (nvs_get_i32(h, "wmark", &v) == ESP_OK) s_tune_wmark     = (int)v;
+    if (nvs_get_i32(h, "high",  &v) == ESP_OK) s_tune_high      = (int)v;
+    if (nvs_get_i32(h, "trim",  &v) == ESP_OK) s_tune_trim      = (int)v;
+    /* 定时播出 */
+    if (nvs_get_i32(h, "lead_ms", &v) == ESP_OK) s_tune_lead_ms    = (int)v;
+    if (nvs_get_i32(h, "dma_ms",  &v) == ESP_OK) s_tune_dma_ms     = (int)v;
+    if (nvs_get_i32(h, "late_ms", &v) == ESP_OK) s_tune_late_drop  = (int)v;
+    if (nvs_get_i32(h, "drain",   &v) == ESP_OK) s_tune_drain_fill = (int)v;
+    if (nvs_get_i32(h, "gap",     &v) == ESP_OK) s_tune_gap_jump   = (int)v;
+    if (nvs_get_i32(h, "ts_sane", &v) == ESP_OK) s_tune_ts_sane_ms = (int)v;
+    if (nvs_get_i32(h, "sync_wait", &v) == ESP_OK) s_tune_sync_wait_ms = (int)v;
+    if (nvs_get_i32(h, "ntp_ms",  &v) == ESP_OK) s_tune_ntp_ms     = (int)v;
+    nvs_close(h);
+    tuning_clamp();
+    tuning_log("loaded");
+}
+
+/* 供升级页面读取当前生效值 */
+void receiver_tuning_get(receiver_tuning_t *t)
+{
+    if (!t) return;
+    t->cache_sz      = s_tune_cache_sz;
+    t->group_rec     = s_tune_group_rec;
+    t->wmark         = s_tune_wmark;
+    t->high          = s_tune_high;
+    t->trim          = s_tune_trim;
+    t->ring          = s_tune_ring_pkts;
+    t->lead_ms       = s_tune_lead_ms;
+    t->dma_ms        = s_tune_dma_ms;
+    t->late_drop_ms  = s_tune_late_drop;
+    t->drain_fill    = s_tune_drain_fill;
+    t->gap_jump      = s_tune_gap_jump;
+    t->ts_sane_ms    = s_tune_ts_sane_ms;
+    t->sync_wait_ms  = s_tune_sync_wait_ms;
+    t->ntp_interval_ms = s_tune_ntp_ms;
+}
+
+/* 供升级页面设置: 严格校验 -> 立即生效(可热改项) -> 存 NVS (内存/硬件相关的重启生效) */
+esp_err_t receiver_tuning_set(const receiver_tuning_t *t)
+{
+    if (!t) return ESP_ERR_INVALID_ARG;
+    const receiver_tuning_t *p = t;
+
+    /* 严格校验 (不静默纠正, 让页面能提示用户) */
+    if (p->wmark < 4 || p->wmark > 160) return ESP_ERR_INVALID_ARG;
+    if (p->high <= p->wmark || p->high > 200) return ESP_ERR_INVALID_ARG;
+    if (p->trim < 1 || p->trim > p->high) return ESP_ERR_INVALID_ARG;
+    if (p->ring < p->high + 8 || p->ring > 400) return ESP_ERR_INVALID_ARG;
+    if (p->group_rec < 2 || p->group_rec > FEC_GROUP_REC_MAX) return ESP_ERR_INVALID_ARG;
+    if (p->cache_sz < p->wmark + p->group_rec + 8 || p->cache_sz > FEC_CACHE_SZ_MAX) return ESP_ERR_INVALID_ARG;
+    if (p->lead_ms < 0 || p->lead_ms > 500) return ESP_ERR_INVALID_ARG;
+    if (p->dma_ms < 2 || p->dma_ms > 32 || (p->dma_ms & 1)) return ESP_ERR_INVALID_ARG;
+    if (p->late_drop_ms < 1 || p->late_drop_ms > 200) return ESP_ERR_INVALID_ARG;
+    if (p->drain_fill < 1 || p->drain_fill > 500) return ESP_ERR_INVALID_ARG;
+    if (p->gap_jump < 1 || p->gap_jump > 2000) return ESP_ERR_INVALID_ARG;
+    if (p->ts_sane_ms < 100 || p->ts_sane_ms > 600000) return ESP_ERR_INVALID_ARG;
+    if (p->sync_wait_ms < 0 || p->sync_wait_ms > 60000) return ESP_ERR_INVALID_ARG;
+    if (p->ntp_interval_ms < 15000 || p->ntp_interval_ms > 3600000) return ESP_ERR_INVALID_ARG;
+
+    /* 立即生效项 (任务下个循环即可读到) */
+    s_tune_wmark       = p->wmark;
+    s_tune_high        = p->high;
+    s_tune_trim        = p->trim;
+    s_tune_lead_ms     = p->lead_ms;
+    s_tune_late_drop   = p->late_drop_ms;
+    s_tune_drain_fill  = p->drain_fill;
+    s_tune_gap_jump    = p->gap_jump;
+    s_tune_ts_sane_ms  = p->ts_sane_ms;
+    s_tune_sync_wait_ms = p->sync_wait_ms;
+    /* 重启生效项 (cache/group/ring 影响内存分配, dma 影响硬件配置, ntp 需重建 SNTP):
+     * 这里只写 NVS, 不改运行时变量, 避免正在运行的任务访问越界/配置错位 */
+    /* s_tune_cache_sz / s_tune_group_rec / s_tune_ring_pkts / s_tune_dma_ms / s_tune_ntp_ms */
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(TUNE_NVS_NS, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        nvs_set_i32(h, "cache_sz", p->cache_sz);
+        nvs_set_i32(h, "group_rec", p->group_rec);
+        nvs_set_i32(h, "ring",  p->ring);
+        nvs_set_i32(h, "wmark", p->wmark);
+        nvs_set_i32(h, "high",  p->high);
+        nvs_set_i32(h, "trim",  p->trim);
+        nvs_set_i32(h, "lead_ms", p->lead_ms);
+        nvs_set_i32(h, "dma_ms",  p->dma_ms);
+        nvs_set_i32(h, "late_ms", p->late_drop_ms);
+        nvs_set_i32(h, "drain",   p->drain_fill);
+        nvs_set_i32(h, "gap",     p->gap_jump);
+        nvs_set_i32(h, "ts_sane", p->ts_sane_ms);
+        nvs_set_i32(h, "sync_wait", p->sync_wait_ms);
+        nvs_set_i32(h, "ntp_ms",  p->ntp_interval_ms);
+        err = nvs_commit(h);
+        nvs_close(h);
+    }
+    ESP_LOGW(TAG, "tuning: set cache=%d group=%d wmark=%d high=%d trim=%d ring=%d | "
+             "lead=%d dma=%d late=%d drain=%d gap=%d ts_sane=%d sync_wait=%d ntp=%d (%s)",
+             p->cache_sz, p->group_rec, p->wmark, p->high, p->trim, p->ring,
+             p->lead_ms, p->dma_ms, p->late_drop_ms, p->drain_fill, p->gap_jump,
+             p->ts_sane_ms, p->sync_wait_ms, p->ntp_interval_ms,
+             err == ESP_OK ? "saved" : "save failed");
+    return err;
+}
+
 /* ============ 主入口 ============ */
 void app_main(void) /* 程序入口: 加载配置, 无配置则进 BLE 配网, 否则启动音频链路 */
 { /* 函数体开始 */
@@ -1671,6 +1853,7 @@ void app_main(void) /* 程序入口: 加载配置, 无配置则进 BLE 配网, �
     setenv("TZ", "CST-8", 1); /* 时区设为北京时间 (UTC+8, 无夏令时); 否则 localtime 输出 UTC */
     tzset(); /* 使 TZ 立即生效, 后续日志/stat 的时间都是本地时间 */
     ESP_ERROR_CHECK(nvs_flash_init()); /* 初始化 NVS flash (配置存储) */
+    tuning_load(); /* 加载可调播放参数 (升级页面 /cfg 保存的值; 无记录用默认值) */
     ESP_ERROR_CHECK(esp_netif_init()); /* 初始化网络接口 */
     ESP_ERROR_CHECK(tcp_log_init(0));  /* TCP 远程日志: telnet/nc <ip> 3333 (不影响 USB 串口) */
     ESP_ERROR_CHECK(esp_event_loop_create_default()); /* 创建默认事件循环 */
@@ -1686,7 +1869,7 @@ void app_main(void) /* 程序入口: 加载配置, 无配置则进 BLE 配网, �
         /* 配网模式也初始化输出链路 (I2S + ACM8815), 否则 BLE 连接提示音无法出声;
          * slot 固定 0 (配网阶段尚无声道配置), 环形缓冲仅给 i2s 任务提供空环 */
         audio_out_init(false, 0); /* 初始化 I2S + DAC (单声道) */
-        ring_init(RING_PKTS * s_pkt_bytes, s_pkt_bytes); /* 空环形缓冲 (无网络生产者) */
+        ring_init(s_tune_ring_pkts * s_pkt_bytes, s_pkt_bytes); /* 空环形缓冲 (无网络生产者) */
         xTaskCreatePinnedToCore(i2s_task, "i2s", 4096, NULL, 5, &s_h_i2s, 0); /* I2S 任务: 播放 BLE 提示音 (核0, 优先级5) */
         ws2812_init(LED_GPIO_WS2812); /* 初始化状态灯 (WS2812B) */
         s_led_base  = LED_ST_BG_BLINK; /* 配网基准状态: 蓝绿交替 */
@@ -1718,13 +1901,13 @@ void app_main(void) /* 程序入口: 加载配置, 无配置则进 BLE 配网, �
     ble_provision_set_conn_cb(on_ble_conn); /* 注册 BLE 连接/断开回调 (切状态灯) */
     xTaskCreatePinnedToCore(led_task, "led", 2048, NULL, 1, NULL, 0); /* 状态灯任务 (核0, 优先级1) */
 
-    /* FEC 包缓存: 64 槽 × ~2.3KB ≈ 148KB, 放 PSRAM (calloc 保证 valid=false);
+    /* FEC 包缓存: s_tune_cache_sz 槽 (升级页面可调), 放 PSRAM (calloc 保证 valid=false);
      * 必须在 net/i2s 任务创建前完成 */
-    s_cache = heap_caps_calloc(FEC_CACHE_SZ, sizeof(pkt_cache_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_cache = heap_caps_calloc((size_t)s_tune_cache_sz, sizeof(pkt_cache_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     assert(s_cache);
 
-    /* 环形缓冲: RING_PKTS 包容量, 目标水位 TARGET_WMARK 包 */
-    ring_init(RING_PKTS * s_pkt_bytes, s_pkt_bytes); /* 初始化环形缓冲 (容量 RING_PKTS 包) */
+    /* 环形缓冲: s_tune_ring_pkts 帧容量, 目标水位 s_tune_wmark 帧 */
+    ring_init(s_tune_ring_pkts * s_pkt_bytes, s_pkt_bytes); /* 初始化环形缓冲 */
 
     /* ESP32-C5 单核: 所有任务固定 Core 0; 优先级分配 i2s(5) > net(4) > stat(1) */
     xTaskCreatePinnedToCore(network_task, "net", 8192, NULL, 4, &s_h_net, 0); /* 网络接收任务 (核0, 优先级4) */
