@@ -11,6 +11,8 @@
 #define OTA_UPDATE_H /* 头文件防重复包含: 定义完成 */
 
 #include "esp_err.h" /* esp_err_t */
+#include <stdbool.h> /* bool */
+#include <stdint.h>  /* int32_t / uint32_t */
 
 #ifdef __cplusplus /* C++ 兼容: 外部链接 "C" 开始 */
 extern "C" { /* C++ 兼容: 声明进入 C 链接域 */
@@ -20,31 +22,29 @@ extern "C" { /* C++ 兼容: 声明进入 C 链接域 */
  *  @return ESP_OK 启动成功 / ESP_ERR_INVALID_STATE 已启动 / 其他 httpd 错误码 */
 esp_err_t ota_update_start(void); /* 启动 OTA 服务 */
 
-/** 升级页面 (/cfg) 可调参数: FEC 缓存 / 环形缓冲 / 定时播出
- *  标"重启生效"的字段只写 NVS, 重启后由 receiver.c 的 tuning_load 加载 */
+/** 运行状态快照 (升级网页 /stat 显示用, receiver.c 实现) */
 typedef struct {
-    int cache_sz;       /* FEC 包缓存槽数 (重启生效) */
-    int group_rec;      /* FEC 组状态记录数 (重启生效) */
-    int wmark;          /* 起播水位 (帧) */
-    int high;           /* 积压上限 (帧) */
-    int trim;           /* 裁剪目标 (帧) */
-    int ring;           /* 环形缓冲容量 (帧, 重启生效) */
-    int lead_ms;        /* 播放前瞻 (ms) */
-    int dma_ms;         /* I2S DMA 深度 (ms, 重启生效) */
-    int late_drop_ms;   /* 迟到丢弃阈值 (ms) */
-    int drain_fill;     /* 单次排水静音上限 (帧) */
-    int gap_jump;       /* 缺口跳转阈值 (包) */
-    int ts_sane_ms;     /* 墙钟判定容差 (ms) */
-    int sync_wait_ms;   /* 起播等对时上限 (ms) */
-    int ntp_interval_ms;/* NTP 刷新周期 (ms, 重启生效) */
-} receiver_tuning_t;
+    bool     synced;          /* 时钟是否已同步 (SNTP) */
+    char     sntp[32];        /* 当前 NTP server */
+    int32_t  ntp_offset_ms;   /* 墙钟 - 发端 RTP ts (ms) */
+    uint32_t ntp_sync_cnt;    /* 累计对时成功次数 */
+    uint32_t rx_pps;          /* 收包速率 (数据包/s) */
+    uint32_t rx_total;        /* 累计数据包 (1ms + 批量) */
+    uint32_t rx_fec;          /* 累计 FEC 包 */
+    uint32_t recovered;       /* FEC 恢复成功包数 */
+    int32_t  late_ms;         /* 当前播放延迟 late (ms, 负=超前) */
+    int32_t  late_min;        /* 统计窗内 late 最小值 */
+    int32_t  late_max;        /* 统计窗内 late 最大值 */
+    int32_t  jitter_ms;       /* 网络抖动 (ms) */
+    uint32_t buffer_ms;       /* ring 缓冲深度 (ms) */
+    uint32_t silence_ms;      /* 累计补静音 (ms) */
+    uint32_t underrun;        /* 欠载次数 */
+    uint32_t late_drop;       /* 因迟到丢弃帧数 */
+    bool     use_wall;        /* true=墙钟模式 / false=本地锚定 */
+} receiver_stats_t;
 
-/** 读取当前生效参数 */
-void receiver_tuning_get(receiver_tuning_t *t); /* receiver.c 实现 */
-
-/** 校验并保存参数; 可热改项立即生效, 内存/硬件相关项重启生效
- *  @return ESP_OK 成功 / ESP_ERR_INVALID_ARG 参数非法 / NVS 错误码 */
-esp_err_t receiver_tuning_set(const receiver_tuning_t *t); /* receiver.c 实现 */
+/** 读取运行状态快照 */
+void receiver_stats_get(receiver_stats_t *st); /* receiver.c 实现 */
 
 #ifdef __cplusplus /* C++ 兼容: 外部链接 "C" 结束 */
 } /* C++ 兼容: 声明域结束 */
